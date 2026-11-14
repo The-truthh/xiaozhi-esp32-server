@@ -1126,21 +1126,36 @@ class ConnectionHandler:
                 self.system_introduced_speakers.add(cs)
                 speaker_for_system = cs
 
-            if self.intent_type == "function_call" and functions is not None:
+            from core.utils.runtime_capabilities import build_runtime_capabilities
+
+            runtime_capabilities = build_runtime_capabilities(
+                self.config, functions, memory_str, self.intent_type
+            )
+            llm_dialogue = self.dialogue.get_llm_dialogue_with_memory(
+                memory_str, self.config.get("voiceprint", {}), speaker_for_system,
+                runtime_capabilities=runtime_capabilities,
+                repair_rejected_naming=True,
+            )
+
+            grounded_response = (
+                self.dialogue.get_naming_grounded_response()
+                if depth == 0 and self.intent_type == "nointent" else None
+            )
+            if grounded_response is not None:
+                # Use the same history and TTS pipeline; don't generate a fake
+                # source for user statements that the application can quote.
+                llm_responses = iter([grounded_response])
+            elif self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                     functions=functions,
                 )
             else:
                 llm_responses = self.llm.response(
                     self.session_id,
-                    self.dialogue.get_llm_dialogue_with_memory(
-                        memory_str, self.config.get("voiceprint", {}), speaker_for_system
-                    ),
+                    llm_dialogue,
                 )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")

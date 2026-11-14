@@ -1,5 +1,6 @@
 import uuid
 import re
+import json
 from typing import List, Dict
 from datetime import datetime
 
@@ -94,9 +95,18 @@ class Dialogue:
     def get_llm_dialogue_with_memory(
             self, memory_str: str = None, voiceprint_config: dict = None,
             current_speaker: str = None,
+            runtime_capabilities: dict = None,
+            repair_rejected_naming: bool = False,
     ) -> List[Dict[str, str]]:
         # 构建对话
         dialogue = []
+        actual_messages = [m for m in self.dialogue
+                           if m.role != "system" and not m.is_temporary]
+        naming_correction_now = False
+        if repair_rejected_naming:
+            actual_messages, naming_correction_now = self._repair_rejected_naming(
+                actual_messages
+            )
 
         # 添加系统提示和记忆
         system_message = next(
@@ -119,6 +129,12 @@ class Dialogue:
                     full_prompt,
                     flags=re.DOTALL,
                 )
+
+            # 每轮依据实际请求重新注入；不修改存储的 system 或虚构执行结果。
+            if runtime_capabilities is not None:
+                full_prompt += "\n<runtime_capabilities>\n" + json.dumps(
+                    runtime_capabilities, ensure_ascii=False
+                ) + "\n</runtime_capabilities>"
 
             # 追加说话人信息
             try:
@@ -145,6 +161,13 @@ class Dialogue:
             except:
                 pass
 
+            if naming_correction_now:
+                full_prompt += (
+                    "\n本轮用户明确指出了上一条助手回答的称呼错误。"
+                    "应用已将该条助手回答从本轮上下文撤回，它不能作为用户说过什么的依据。"
+                    "简短承认自己的错误。用户没有新的明确称呼要求时，使用中性的‘您’。"
+                )
+
             dialogue.append({"role": "system", "content": full_prompt})
 
         # 第二段：few-shot 示例（会话内不变）
@@ -155,9 +178,111 @@ class Dialogue:
             self.getMessages(m, dialogue)
 
         # 第三段：实际对话历史（不含 few-shot）
-        actual_messages = [m for m in non_system_messages if not m.is_temporary]
         complete_actual = self._ensure_tool_calls_complete(actual_messages)
         for m in complete_actual:
             self.getMessages(m, dialogue)
 
         return dialogue
+
+    @staticmethod
+    def _explicit_naming_rejection(content):
+        """High-precision correction cue, not general sentiment/name extraction."""
+        if not isinstance(content, str):
+            return False
+        text = content.strip()
+        try:
+            wrapped = json.loads(text)
+            if isinstance(wrapped, dict) and isinstance(wrapped.get("content"), str):
+                text = wrapped["content"].strip()
+        except (ValueError, TypeError):
+            pass
+        # Do not treat quotations/third-party reports, a simple nickname request,
+        # or a double negative as the user's direct correction.
+        if re.search(r"(?:没|没有)说过.{0,16}(?:不让|不要|不许|别)", text):
+            return False
+        return bool(
+            re.search(r"(?:叫|称呼|喊)", text)
+            and re.match(
+                r"^(?:不对[，,。\s]*)?(?:我(?:并)?(?:没|没有)说过|"
+                r"我(?:并)?(?:没|没有)让你|你(?:刚才)?说错了|别乱叫|别乱称呼)",
+                text,
+            )
+        )
+
+    @classmethod
+    def _repair_rejected_naming(cls, actual_messages):
+        """Withdraw only the directly rejected plain assistant turn from API input.
+
+        Original Message objects and stored conversation remain intact. Tool turns
+        are never removed. This is context repair, not deletion or new memory.
+        """
+        withdrawn = set()
+        correction_now = False
+        for i, message in enumerate(actual_messages):
+            if (i == 0 or message.role != "user"
+                    or not cls._explicit_naming_rejection(message.content)):
+                continue
+            previous = actual_messages[i - 1]
+            if (previous.role == "assistant" and not previous.tool_calls
+                    and isinstance(previous.content, str)
+                    and re.search(r"(?:叫|称呼|喊)", previous.content)):
+                withdrawn.add(i - 1)
+                correction_now = i == len(actual_messages) - 1
+        return [m for i, m in enumerate(actual_messages) if i not in withdrawn], correction_now
+
+    def get_naming_grounded_response(self):
+        """Narrow, deterministic replies for greeting and explicit source inquiries.
+
+        Quote actual user speech, rather than ask a generative model to invent its
+        provenance. No inferred nickname, persistent profile, or extra API call.
+        Return None for ordinary conversation and requests outside this scope.
+        """
+        users = [m.content for m in self.dialogue if m.role == "user"
+                 and not m.is_temporary and isinstance(m.content, str)]
+        if not users:
+            return None
+
+        def speech(text):
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict) and isinstance(data.get("content"), str):
+                    return data["content"].strip()
+            except (ValueError, TypeError):
+                pass
+            return text.strip()
+
+        text = speech(users[-1])
+        if re.fullmatch(r"(?:你好|您好|嗨|哈喽|hello|hi)[，,。.!！?？\s]*", text, re.I):
+            return "您好，我在呢。"
+
+        actual = [m for m in self.dialogue if m.role != "system" and not m.is_temporary]
+        repaired, correction_now = self._repair_rejected_naming(actual)
+        # A correction may also give a new nickname; leave that request to the
+        # model, with its rejected preceding turn withdrawn by the assembler.
+        new_request = re.search(r"(?:以后|改成|现在|就|请)(?:就)?(?:叫|喊|称呼)我", text)
+        if correction_now and not new_request:
+            return "是我说错了。我先称呼您为‘您’。"
+
+        naming_source = (
+            re.fullmatch(r"我(?:刚才|之前)?(?:称呼|叫过|叫)你(?:了)?吗[？?。\s]*", text)
+            or re.search(r"我(?:有没有|是否)(?:告诉|说过|让).{0,12}(?:称呼|叫|喊)", text)
+            or re.search(r"我(?:什么时候|哪时候|何时|哪里|哪儿)说.{0,16}(?:叫|称呼|喊)", text)
+            or re.fullmatch(r"你为什么(?:这么|这样)(?:叫|称呼)我[？?。\s]*", text)
+        )
+        recap = re.search(r"(?:这次|本次|这段)对话.{0,12}我(?:真正|实际|到底|刚才)?说了什么", text)
+        if not naming_source and not recap:
+            return None
+
+        prior = [speech(t) for t in users[:-1]]
+        if not prior:
+            return "这段对话刚开始，我还没有可核对的前文。"
+        # This is a bounded quotation, never a claim to have searched all history.
+        # Keep denials, questions and third-party reports verbatim, without
+        # converting mentions of a name into an instruction to use it.
+        excerpts = []
+        for value in prior[-2:]:
+            excerpt = value[:80]
+            if len(value) > 80:
+                excerpt += "……"
+            excerpts.append("‘" + excerpt + "’")
+        return "在您这次提问前，我能核对到的最近原话是：" + "；".join(excerpts) + "。"
