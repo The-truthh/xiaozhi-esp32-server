@@ -14,7 +14,7 @@ async def handleAbortMessage(conn: "ConnectionHandler"):
     if initiative:
         initiative.cancel('收到打断',abort=False)
         initiative.normal_busy=False
-        initiative.asr_pending=False
+        # An output abort must not finish a newer, real user utterance.
     # 设置成打断状态，会自动打断llm、tts任务
     conn.close_after_chat = False
     conn.client_abort = True

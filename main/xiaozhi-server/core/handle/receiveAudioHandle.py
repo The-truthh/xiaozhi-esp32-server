@@ -24,14 +24,9 @@ async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
         if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
             conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
         return
-    if have_voice:
-        from core.utils.companion_initiative import voice_activity
-        await voice_activity(conn)
-    elif getattr(conn,'client_voice_stop',False):
-        initiative=getattr(conn,'_initiative_runtime',None)
-        if initiative and initiative.voice_until>time.time():
-            from core.utils.companion_initiative import voice_activity
-            await voice_activity(conn,have_voice=False,asr_pending=True)
+    from core.utils.companion_initiative import voice_activity
+    await voice_activity(conn,have_voice=have_voice,
+                         asr_pending=not have_voice and getattr(conn,'client_voice_stop',False))
     # 服务端AEC功能需要实时触发打断
     if conn.client_aec and have_voice:
         if conn.client_is_speaking and conn.client_listen_mode != "manual":
@@ -48,7 +43,7 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
     conn.just_woken_up = False
 
 
-async def startToChat(conn: "ConnectionHandler", text, origin="asr"):
+async def startToChat(conn: "ConnectionHandler", text, origin="asr", input_token=None):
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     actual_text = text
@@ -105,6 +100,7 @@ async def startToChat(conn: "ConnectionHandler", text, origin="asr"):
         import uuid
         event = {'id': uuid.uuid4().hex, 'role': 'user', 'text': actual_text,
                  'origin': origin, 'observed_at': datetime.now(timezone.utc).isoformat()}
+        if input_token is not None:event['input_token']=input_token
         from core.utils.companion_initiative import user_input
         await user_input(conn,event)
         from core.handle.intentHandler import check_direct_exit

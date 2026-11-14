@@ -543,9 +543,16 @@ class InitiativeStore(CompanionStore):
                 id TEXT PRIMARY KEY,scope TEXT NOT NULL,companion_id TEXT NOT NULL,epoch INTEGER NOT NULL,user_seq INTEGER NOT NULL,
                 owner TEXT NOT NULL,topic_key TEXT NOT NULL,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,
                 payload TEXT NOT NULL,created_at REAL NOT NULL,deadline REAL NOT NULL,status TEXT NOT NULL,
+                opportunity_key TEXT DEFAULT NULL,
                 turn_id TEXT NOT NULL DEFAULT '',reply_text TEXT NOT NULL DEFAULT '',completed_at REAL,
-                UNIQUE(scope,companion_id,epoch,user_seq));
+                UNIQUE(scope,companion_id,epoch,opportunity_key));
                 CREATE INDEX IF NOT EXISTS initiative_recent ON companion_initiative_candidates(scope,companion_id,created_at);''')
+            columns={r['name'] for r in db.execute('PRAGMA table_info(companion_initiative_candidates)')}
+            if 'opportunity_key' not in columns:
+                self._migrate_candidates(db)
+            columns={r['name'] for r in db.execute('PRAGMA table_info(companion_initiative_subjects)')}
+            for name,definition in (('gate_reason',"TEXT NOT NULL DEFAULT ''"),('gate_session',"TEXT NOT NULL DEFAULT ''"),('gate_at','REAL NOT NULL DEFAULT 0')):
+                if name not in columns:db.execute('ALTER TABLE companion_initiative_subjects ADD COLUMN '+name+' '+definition)
             # Remain forget-safe after a code rollback: old binaries already
             # advance scopes.epoch but do not know the new derived tables.
             for table in ('companion_affect','companion_affect_events','companion_episodes',
@@ -555,6 +562,45 @@ class InitiativeStore(CompanionStore):
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
                     db.executescript('CREATE TRIGGER IF NOT EXISTS forget_'+table+' AFTER UPDATE OF epoch ON scopes '
                         'WHEN NEW.epoch!=OLD.epoch BEGIN DELETE FROM '+table+' WHERE scope=NEW.scope; END;')
+
+    @staticmethod
+    def opportunity_key(material):
+        basis=material.get('basis_key') or ':'.join(str(material[k]) for k in ('source_kind','source_id','source_revision'))
+        return hashlib.sha256(str(basis).encode()).hexdigest()
+
+    def _migrate_candidates(self,db):
+        # Atomically remove the old per-user-input UNIQUE constraint. All
+        # existing rows/IDs/statuses survive; factual/source tables are untouched.
+        db.execute('BEGIN IMMEDIATE')
+        db.execute('DROP TRIGGER IF EXISTS forget_companion_initiative_candidates')
+        schema=db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='companion_initiative_candidates'").fetchone()[0]
+        import re
+        schema=re.sub(r'CREATE TABLE(?: IF NOT EXISTS)?\s+companion_initiative_candidates',
+            'CREATE TABLE companion_initiative_candidates_next',schema,count=1,flags=re.I)
+        schema=re.sub(r'UNIQUE\s*\(\s*scope\s*,\s*companion_id\s*,\s*epoch\s*,\s*user_seq\s*\)',
+            "opportunity_key TEXT DEFAULT NULL, UNIQUE(scope,companion_id,epoch,opportunity_key)",schema,flags=re.I)
+        db.execute(schema)
+        rows=[dict(r) for r in db.execute('SELECT * FROM companion_initiative_candidates ORDER BY created_at,id')];used=set()
+        for row in rows:
+            material=json.loads(row['payload']);key=self.opportunity_key(dict(row,**{k:v for k,v in material.items() if k=='basis_key'}))
+            marker=(row['scope'],row['companion_id'],row['epoch'],key)
+            if marker in used:key='legacy:'+row['id']
+            used.add(marker);row['opportunity_key']=key
+            db.execute('INSERT INTO companion_initiative_candidates_next('+','.join(row)+') VALUES('+','.join('?' for _ in row)+')',tuple(row.values()))
+        db.execute('DROP TABLE companion_initiative_candidates')
+        db.execute('ALTER TABLE companion_initiative_candidates_next RENAME TO companion_initiative_candidates')
+        db.execute('CREATE INDEX initiative_recent ON companion_initiative_candidates(scope,companion_id,created_at)')
+        db.execute('CREATE TRIGGER forget_companion_initiative_candidates AFTER UPDATE OF epoch ON scopes WHEN NEW.epoch!=OLD.epoch BEGIN DELETE FROM companion_initiative_candidates WHERE scope=NEW.scope; END;')
+        db.commit()
+
+    def record_gate(self,scope,companion,session,epoch,reason):
+        allowed={'asr_pending','user_voice','normal_generation','closing','routing','playback','playback_guard','audio_queue',
+                 'not_armed','idle_wait','initiative_generation','quiet','cooldown','no_material','no_unused_opportunity',
+                 'queued','failed','model_silent'}
+        if reason not in allowed:raise ValueError('Unknown initiative gate')
+        with self.db() as db:
+            db.execute('UPDATE companion_initiative_subjects SET gate_reason=?,gate_session=?,gate_at=? WHERE scope=? AND companion_id=? AND epoch=? AND last_session=?',
+                (reason,session,time.time(),scope,companion,epoch,session))
 
     def _subject(self,db,scope,companion):
         epoch=self.ledger._epoch(db,scope)
@@ -612,7 +658,7 @@ class InitiativeStore(CompanionStore):
         r=db.execute('SELECT * FROM '+table+' WHERE id=? AND scope=? AND companion_id=? AND epoch=?',
             (identifier,candidate['scope'],candidate['companion_id'],candidate['epoch'])).fetchone()
         return bool(r and r['revision']==revision and r['status'] in ('pending','active')
-            and (kind!='topic' or r['is_current']))
+            and r['expires_at']>time.time())
 
     def claim(self,scope,companion,session,material,*,silence,cooldown,ttl,source_age,max_per_session,topic_cooldown,stamp=None):
         now=time.time() if stamp is None else stamp
@@ -620,23 +666,24 @@ class InitiativeStore(CompanionStore):
             db.execute('BEGIN IMMEDIATE');s=self._subject(db,scope,companion)
             if (s['last_session']!=session or s['user_seq']<=0 or s['last_route'] not in ('chat','grounded')
                     or now-s['last_user_at']<silence or now-s['last_user_at']>source_age or s['quiet_until']>now
-                    or (s['last_attempt_at'] and now-s['last_attempt_at']<cooldown) or s['last_delivered_seq']>=s['user_seq']
+                    or (s['last_attempt_at'] and now-s['last_attempt_at']<cooldown)
                     or not self._ready(db,s,session,now)):return None
             db.execute("UPDATE companion_initiative_candidates SET status='expired' WHERE scope=? AND companion_id=? AND status IN ('leased','committed') AND deadline<=?",(scope,companion,now))
-            if db.execute('SELECT 1 FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND epoch=? AND user_seq=?',
-                (scope,companion,s['epoch'],s['user_seq'])).fetchone():return None
+            key=self.opportunity_key(material)
+            if db.execute('SELECT 1 FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND epoch=? AND (opportunity_key=? OR (source_kind=? AND source_id=? AND source_revision=?))',
+                (scope,companion,s['epoch'],key,material['source_kind'],material['source_id'],material['source_revision'])).fetchone():return None
             used=db.execute("SELECT count(*) FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND owner=? AND turn_id!=''",
                 (scope,companion,session)).fetchone()[0]
             if used>=max_per_session:return None
             if db.execute("SELECT 1 FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND topic_key=? AND created_at>? AND turn_id!='' LIMIT 1",
                 (scope,companion,material['topic_key'],now-topic_cooldown)).fetchone():return None
-            identifier=hashlib.sha256(json.dumps([scope,companion,s['epoch'],s['user_seq']]).encode()).hexdigest()
+            identifier=hashlib.sha256(json.dumps([scope,companion,s['epoch'],key]).encode()).hexdigest()
             material=dict(material,topic_id=material['topic_key'],expires_at=now+ttl,
                 pause_elapsed_seconds=round(now-s['last_user_at'],1),no_new_user_message=True,
                 source_refs=[dict(kind=material['source_kind'],id=material['source_id'],revision=material['source_revision'])])
             item=dict(id=identifier,scope=scope,companion_id=companion,epoch=s['epoch'],user_seq=s['user_seq'],owner=session,
                 topic_key=material['topic_key'],source_kind=material['source_kind'],source_id=material['source_id'],source_revision=material['source_revision'],
-                payload=json.dumps(material,ensure_ascii=False),created_at=now,deadline=now+ttl,status='leased')
+                payload=json.dumps(material,ensure_ascii=False),created_at=now,deadline=now+ttl,status='leased',opportunity_key=key)
             if not self._source_current(db,item):return None
             db.execute('INSERT INTO companion_initiative_candidates('+','.join(item)+') VALUES('+','.join('?' for _ in item)+')',tuple(item.values()))
             db.execute('UPDATE companion_initiative_subjects SET last_attempt_at=? WHERE scope=? AND companion_id=?',(now,scope,companion))

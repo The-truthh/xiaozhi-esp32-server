@@ -71,6 +71,8 @@ class ASRProvider(ASRProviderBase):
                 await self._start_recognition(conn)
             except Exception as e:
                 logger.bind(tag=TAG).error(f"开始识别失败: {str(e)}")
+                from core.utils.companion_initiative import input_finished
+                await input_finished(conn, getattr(self, '_initiative_input_token', None))
                 await self._cleanup()
                 return
 
@@ -80,6 +82,8 @@ class ASRProvider(ASRProviderBase):
                 await self.asr_ws.send(pcm_frame)
             except Exception as e:
                 logger.bind(tag=TAG).warning(f"发送音频失败: {str(e)}")
+                from core.utils.companion_initiative import input_finished
+                await input_finished(conn, getattr(self, '_initiative_input_token', None))
                 await self._cleanup()
 
     async def _start_recognition(self, conn: "ConnectionHandler"):
@@ -91,6 +95,8 @@ class ASRProvider(ASRProviderBase):
 
             self.is_processing = True
             self.task_id = uuid.uuid4().hex
+            from core.utils.companion_initiative import current_input_token
+            self._initiative_input_token = current_input_token(conn)
             self.finish_sent = False
 
             # 建立WebSocket连接
@@ -192,6 +198,8 @@ class ASRProvider(ASRProviderBase):
 
     async def _forward_results(self, conn: "ConnectionHandler"):
         """转发识别结果"""
+        from core.utils.companion_initiative import input_finished, current_input_token
+        input_token = getattr(self, '_initiative_input_token', None)
         try:
             while not conn.stop_event.is_set():
                 # 获取当前连接的音频数据
@@ -281,8 +289,11 @@ class ASRProvider(ASRProviderBase):
             logger.bind(tag=TAG).error(f"结果转发失败: {str(e)}")
         finally:
             # 清理连接的音频缓存
-            await self._cleanup()
-            conn.reset_audio_states()
+            try:
+                await self._cleanup()
+            finally:
+                await input_finished(conn, input_token)
+                if current_input_token(conn) in (None, input_token):conn.reset_audio_states()
 
     async def _send_stop_request(self):
         """发送停止请求(用于手动模式停止录音)"""

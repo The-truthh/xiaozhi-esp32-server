@@ -34,6 +34,7 @@ class InitiativePolicy:
  max_per_session:int=2
  topic_cooldown_seconds:float=86400
  max_output_chars:int=160
+ asr_wait_seconds:float=15
 
 
 def select_initiative(conn):
@@ -57,7 +58,7 @@ def select_initiative(conn):
   for key,default,low,high in [('min_silence_seconds',20,10,180),('cooldown_seconds',180,30,3600),('candidate_ttl_seconds',60,20,120),
     ('max_source_age_seconds',600,30,3600),('quiet_ttl_seconds',3600,60,86400),('heartbeat_seconds',2,.2,10),
     ('presence_ttl_seconds',8,2,60),('playback_guard_seconds',2,1,15),('max_per_session',2,1,5),
-    ('topic_cooldown_seconds',86400,60,604800),('max_output_chars',160,40,500)]:
+    ('topic_cooldown_seconds',86400,60,604800),('max_output_chars',160,40,500),('asr_wait_seconds',15,5,60)]:
    value=cfg.get(key,default)
    if type(value) not in (int,float) or not math.isfinite(value) or not low<=value<=high:return None
    if key in ('max_per_session','max_output_chars') and type(value) is not int:return None
@@ -107,6 +108,8 @@ class InitiativeRuntime:
   self.store=InitiativeStore(self.managed.engine.store);self.epoch=self.managed.delivery_token()[0]
   self.closed=False;self.armed=False;self.normal_busy=False;self.asr_pending=False;self.voice_until=0
   self.idle_since=time.time();self.transport_done=None;self.transport_at=0;self.nonce=0;self.event_id=''
+  self.input_token=None;self.input_open=False;self.input_phase='idle';self.input_wait_at=None;self.last_frame_voice=False
+  self.user_turn=None;self.last_gate=None
   self.packet=None;self.delivery=None;self.future=None;self.generation_task=None;self.task=None;self.last_voice_write=0
   _REGISTRY.add(self)
   if start:self.task=asyncio.create_task(self.run())
@@ -124,22 +127,55 @@ class InitiativeRuntime:
   ws=getattr(self.conn,'websocket',None);stop=getattr(self.conn,'stop_event',None)
   return bool(ws is not None and not getattr(ws,'closed',False) and (not stop or not stop.is_set()))
 
- def busy(self,own_turn=None):
+ def voice_seen(self,now):
+  # Only a real VAD edge opens an input. Late silent packets cannot do so.
+  if not self.input_open or (self.input_phase=='waiting' and not self.last_frame_voice):
+   self.input_token=uuid.uuid4().hex;self.input_open=True
+  self.input_phase='voice';self.input_wait_at=None;self.asr_pending=False
+  self.last_frame_voice=True;self.voice_until=now+2;self.idle_since=now
+
+ def wait_for_input(self,now):
+  self.last_frame_voice=False
+  if not self.input_open:return
+  if self.input_phase!='waiting':self.input_wait_at=now
+  self.input_phase='waiting';self.asr_pending=True
+
+ def finish_input(self,token):
+  if token is None or token!=self.input_token or not self.input_open:return False
+  self.input_open=False;self.input_phase='idle';self.input_wait_at=None
+  self.asr_pending=False;self.voice_until=0;self.last_frame_voice=False;self.idle_since=time.time()
+  return True
+
+ def busy_reason(self,own_turn=None):
   c=self.conn;now=time.time()
-  if self.asr_pending or self.normal_busy or self.voice_until>now or getattr(c,'close_after_chat',False):return True
+  if self.input_open and self.input_phase=='voice' and now>=self.voice_until:
+   self.wait_for_input(self.voice_until)
+  if self.asr_pending and self.input_wait_at is not None and now-self.input_wait_at>=self.policy.asr_wait_seconds and now>=self.voice_until:
+   self.finish_input(self.input_token)
+  if self.asr_pending:return 'asr_pending'
+  if self.voice_until>now:return 'user_voice'
+  if self.normal_busy:return 'normal_generation'
+  if getattr(c,'close_after_chat',False):return 'closing'
   router=getattr(getattr(c,'information_session',None),'task',None)
-  if router and not router.done():return True
-  if self.future and not self.future.done():return True
-  if own_turn and getattr(c,'sentence_id',None)==own_turn:return False
+  if router and not router.done():return 'routing'
+  if self.future and not self.future.done():return 'normal_generation'
+  if own_turn and getattr(c,'sentence_id',None)==own_turn:return None
   if getattr(c,'client_is_speaking',False):
-   if not (getattr(c,'calling',False) and self.transport_done==getattr(c,'sentence_id',None)):return True
-  if now-self.transport_at<self.policy.playback_guard_seconds:return True
+   if not (getattr(c,'calling',False) and self.transport_done==getattr(c,'sentence_id',None)):return 'playback'
+  if now-self.transport_at<self.policy.playback_guard_seconds:return 'playback_guard'
   tts=getattr(c,'tts',None)
   for name in ('tts_text_queue','tts_audio_queue'):
    q=getattr(tts,name,None)
-   if q is not None and not q.empty():return True
+   if q is not None and not q.empty():return 'audio_queue'
   control=getattr(c,'audio_rate_controller',None)
-  return bool(control and getattr(control,'queue',None))
+  return 'audio_queue' if control and getattr(control,'queue',None) else None
+
+ def busy(self,own_turn=None):return self.busy_reason(own_turn) is not None
+
+ async def gate(self,reason):
+  if self.last_gate==reason:return
+  self.last_gate=reason
+  await asyncio.to_thread(self.store.record_gate,self.scope,self.policy.companion_id,self.conn.session_id,self.epoch,reason)
 
  async def pulse(self):
   if not self.binding_current() or not self.connected():return False
@@ -149,51 +185,72 @@ class InitiativeRuntime:
    self.conn.device_id,busy,self.voice_until,self.policy.presence_ttl_seconds)
   return True
 
- def material(self,subject):
+ def materials(self,subject):
   from core.utils.companion_topics import _unquoted
   text=_unquoted(subject['last_text'])
-  if re.search(r'没(?:有)?别的事|今天就到这|先聊到这|都说完了|今天的事说完|不用回复|不必回复',text):return None
-  # Q4 carries topic-local quiet. It is a hard eligibility gate here, not a
-  # request for an unreliable final author to honour a hidden preference.
+  if re.search(r'没(?:有)?别的事|今天就到这|先聊到这|都说完了|今天的事说完|不用回复|不必回复',text):return []
+  items=[];seen=set();now=time.time()
+  def add(item):
+   basis=item['basis_key']
+   if basis not in seen:items.append(item);seen.add(basis)
   with self.store.db() as db:
    tables={r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
    if 'companion_topics' in tables:
-    row=db.execute('SELECT * FROM companion_topics WHERE scope=? AND companion_id=? AND epoch=? AND is_current=1 AND expires_at>?',
-      (self.scope,self.policy.companion_id,self.epoch,time.time())).fetchone()
-    if row and row['session_id']==self.conn.session_id:
+    rows=db.execute('SELECT * FROM companion_topics WHERE scope=? AND companion_id=? AND epoch=? AND expires_at>? ORDER BY is_current DESC,last_mentioned DESC LIMIT 8',
+      (self.scope,self.policy.companion_id,self.epoch,now)).fetchall()
+    for row in rows:
+     if row['session_id']!=self.conn.session_id:continue
      prefs=json.loads(row['user_preference'])
-     if row['status']!='pending' or prefs.get('listening_only',{}).get('value') or any(prefs.get(k,{}).get('value') is False for k in ('questions_allowed','advice_allowed')):return None
+     held=row['status']!='pending' or prefs.get('listening_only',{}).get('value') or any(prefs.get(k,{}).get('value') is False for k in ('questions_allowed','advice_allowed'))
+     if row['is_current'] and held:return []
+     if held or now-row['last_mentioned']>self.policy.max_source_age_seconds:continue
      refs=json.loads(row['source_refs']);quote=(refs[-1].get('quote') or refs[-1].get('text','')) if refs else ''
-     if not quote:return None
-     return dict(topic_key='topic:'+row['id'],source_kind='topic',source_id=row['id'],source_revision=row['revision'],topic=row['topic'],
-       pending_point=row['pending_point'],user_quote=quote,source_session=row['session_id'],why_now='本通仍在聊这件具体事情，已有短暂停顿；只在有自然的新内容时接一句。')
+     if not quote:continue
+     add(dict(topic_key='topic:'+row['id'],source_kind='topic',source_id=row['id'],source_revision=row['revision'],topic=row['topic'],
+       basis_key='turn:'+row['session_id']+':'+row['source_turn'],pending_point=row['pending_point'],user_quote=quote,
+       source_session=row['session_id'],why_now='本通有来源的待续点；停顿后只有值得补充的新内容才接一句。'))
    if 'companion_episodes' in tables:
-    row=db.execute("SELECT e.*,s.user_text,s.session_id FROM companion_episodes e JOIN companion_episode_sources s ON s.id=e.source_id WHERE e.scope=? AND e.companion_id=? AND e.epoch=? AND e.status='active' AND e.observed_at>? AND e.expires_at>? ORDER BY e.source_seq DESC LIMIT 1",
-     (self.scope,self.policy.companion_id,self.epoch,time.time()-self.policy.max_source_age_seconds,time.time())).fetchone()
-    if row:
-     p=json.loads(row['payload'])
-     if p.get('unfinished') and row['session_id']==self.conn.session_id:
-      return dict(topic_key='episode:'+row['id'],source_kind='episode',source_id=row['id'],source_revision=row['revision'],topic=p['topic'],
-        pending_point=p['summary'],user_quote=p['user_quote'],source_session=row['session_id'],why_now='本通有来源的未完片段；若此刻有一句值得补充的话再说。')
+    rows=db.execute("SELECT e.*,s.user_text,s.session_id,s.source_turn FROM companion_episodes e JOIN companion_episode_sources s ON s.id=e.source_id WHERE e.scope=? AND e.companion_id=? AND e.epoch=? AND e.status='active' AND e.observed_at>? AND e.expires_at>? ORDER BY e.source_seq DESC LIMIT 8",
+     (self.scope,self.policy.companion_id,self.epoch,now-self.policy.max_source_age_seconds,now)).fetchall()
+    for row in rows:
+     payload=json.loads(row['payload'])
+     if not payload.get('unfinished') or row['session_id']!=self.conn.session_id:continue
+     add(dict(topic_key='episode:'+row['id'],source_kind='episode',source_id=row['id'],source_revision=row['revision'],topic=payload['topic'],
+        basis_key='turn:'+row['session_id']+':'+row['source_turn'],pending_point=payload['summary'],user_quote=payload['user_quote'],source_session=row['session_id'],
+        why_now='本通另一段有来源的未完片段；没有新内容就沉默，不要求用户回应。'))
   text=subject['last_text']
-  if len(text)<12 or re.search(r'[？?]|叫什么|记得|帮我查|查一下|天气|新闻|怎么|什么|吗[。！!]*$',text):return None
-  return dict(topic_key='user:'+subject['last_event'],source_kind='user',source_id=subject['last_event'],source_revision=subject['user_seq'],
-    topic='本通刚分享的事情',pending_point='',user_quote=text,source_session=subject['last_session'],
-    why_now='本通用户刚分享了具体内容，停顿后允许角色判断是否有自然的一句想接，不强求发言。')
+  if len(text)>=12 and not re.search(r'[？?]|叫什么|记得|帮我查|查一下|天气|新闻|怎么|什么|吗[。！!]*$',text):
+   basis='turn:'+self.conn.session_id+':'+self.user_turn[1] if self.user_turn and self.user_turn[0]==subject['last_event'] else 'input:'+subject['last_event']
+   add(dict(topic_key='user:'+subject['last_event'],source_kind='user',source_id=subject['last_event'],source_revision=subject['user_seq'],
+    basis_key=basis,topic='本通刚分享的事情',pending_point='',user_quote=text,source_session=subject['last_session'],
+    why_now='本通用户分享的具体内容；只有有自然的新想法才接一句。'))
+  return items
+
+ def material(self,subject):
+  items=self.materials(subject)
+  return items[0] if items else None
 
  async def tick(self):
   if not await self.pulse():return
-  if not self.armed or not self.can_speak or self.busy() or time.time()-self.idle_since<self.policy.min_silence_seconds:return
-  if self.generation_task and not self.generation_task.done():return
+  reason=self.busy_reason()
+  if reason:await self.gate(reason);return
+  if not self.armed or not self.can_speak:await self.gate('not_armed');return
+  if time.time()-self.idle_since<self.policy.min_silence_seconds:await self.gate('idle_wait');return
+  if self.generation_task and not self.generation_task.done():await self.gate('initiative_generation');return
   subject=await asyncio.to_thread(self.store.read_subject,self.scope,self.policy.companion_id)
   if subject['last_session']!=self.conn.session_id:return
-  material=await asyncio.to_thread(self.material,subject)
-  if not material:return
+  if subject['quiet_until']>time.time():await self.gate('quiet');return
+  if subject['last_attempt_at'] and time.time()-subject['last_attempt_at']<self.policy.cooldown_seconds:await self.gate('cooldown');return
+  materials=await asyncio.to_thread(self.materials,subject)
+  if not materials:await self.gate('no_material');return
   p=self.policy
-  ticket=await asyncio.to_thread(self.store.claim,self.scope,p.companion_id,self.conn.session_id,material,
+  for material in materials:
+   ticket=await asyncio.to_thread(self.store.claim,self.scope,p.companion_id,self.conn.session_id,material,
     silence=p.min_silence_seconds,cooldown=p.cooldown_seconds,ttl=p.candidate_ttl_seconds,source_age=p.max_source_age_seconds,
     max_per_session=p.max_per_session,topic_cooldown=p.topic_cooldown_seconds)
-  if ticket:self.generation_task=asyncio.create_task(self.generate(ticket))
+   if ticket:
+    await self.gate('initiative_generation');self.generation_task=asyncio.create_task(self.generate(ticket));return
+  await self.gate('no_unused_opportunity')
 
  async def run(self):
   try:
@@ -224,7 +281,7 @@ class InitiativeRuntime:
   from core.utils.companion_speech import SpeechQueue
   from core.providers.tts.dto.dto import TTSMessageDTO,SentenceType,ContentType
   from core.utils.companion_affect import complete_affect_turn
-  c=self.conn;nonce=self.nonce;sid=uuid.uuid4().hex
+  c=self.conn;nonce=self.nonce;sid=uuid.uuid4().hex;previous_sid=getattr(c,'sentence_id',None);handed_off=False
   packet=dict(generation=getattr(c,'lookup_generation',0),route='chat',input_origin='initiative',initiative_opportunity=ticket['material'])
   self.packet=packet
   try:
@@ -238,7 +295,7 @@ class InitiativeRuntime:
    def author():return list(natural_reply_responses(c,packet,'',query=None,reply_policy=policy,sentence_id=sid))
    replies=await asyncio.to_thread(author)
    if packet.get('runtime_event') or not replies:
-    self.store.settle(ticket,'failed' if packet.get('runtime_event') else 'skipped');return
+    self.store.settle(ticket,'failed' if packet.get('runtime_event') else 'skipped');await self.gate('failed' if packet.get('runtime_event') else 'model_silent');return
    text=''.join(replies)
    if (not text or len(text)>self.policy.max_output_chars or SILENT in text):self.store.settle(ticket,'skipped');return
    if nonce!=self.nonce or not self.binding_current() or self.busy() or not self.store.current(ticket):self.store.settle(ticket,'cancelled');return
@@ -258,13 +315,16 @@ class InitiativeRuntime:
    enqueue(TTSMessageDTO(sid,SentenceType.FIRST,ContentType.ACTION))
    enqueue(TTSMessageDTO(sid,SentenceType.MIDDLE,ContentType.TEXT,content_detail=text))
    enqueue(TTSMessageDTO(sid,SentenceType.LAST,ContentType.ACTION))
+   handed_off=True
    complete_affect_turn(c,text,sid,packet)
+   await self.gate('queued')
    _log(c,'主动台词已入队: '+ticket['id'])
   except asyncio.CancelledError:
    packet['initiative_cancelled']=True;self.store.settle(ticket,'cancelled')
   except Exception as exc:
    self.store.settle(ticket,'failed');_log(c,'主动发言未交付: '+type(exc).__name__)
   finally:
+   if not handed_off and c.sentence_id==sid and nonce==self.nonce:c.sentence_id=previous_sid
    if self.packet is packet:self.packet=None
 
  async def close(self):
@@ -307,7 +367,9 @@ async def user_input(conn,event):
  for peer in list(_REGISTRY):
   if peer.same_subject(runtime):peer.cancel('用户有新输入')
  if origin not in ('asr','user_text'):return
- runtime.armed=True;runtime.normal_busy=True;runtime.asr_pending=False;runtime.event_id=event['id']
+ runtime.armed=True;runtime.normal_busy=True;runtime.event_id=event['id']
+ token=event.get('input_token') or runtime.input_token
+ runtime.finish_input(token)
  await asyncio.to_thread(runtime.store.user_input,runtime.scope,runtime.policy.companion_id,conn.session_id,event['id'],text,
    quiet_command(text),runtime.policy.quiet_ttl_seconds)
  await runtime.pulse()
@@ -322,9 +384,31 @@ def reply_submitted(conn,event,packet,future):
   except Exception as exc:_log(conn,'主动候选路由登记不可用: '+type(exc).__name__)
  if future:
   def done(_):
-   if runtime.future is future:runtime.normal_busy=False;runtime.idle_since=time.time()
+   if runtime.future is future:
+    runtime.normal_busy=False;runtime.idle_since=time.time()
+    if event:runtime.user_turn=(event['id'],getattr(conn,'sentence_id',''))
   future.add_done_callback(done)
  else:runtime.normal_busy=False
+
+
+def current_input_token(conn):
+ runtime=getattr(conn,'_initiative_runtime',None)
+ return runtime.input_token if runtime and runtime.input_open else None
+
+
+@optional_hook
+async def input_finished(conn,token):
+ runtime=getattr(conn,'_initiative_runtime',None)
+ if runtime and runtime.finish_input(token):await runtime.pulse()
+
+
+@optional_hook
+async def listen_started(conn):
+ runtime=getattr(conn,'_initiative_runtime',None)
+ if runtime:
+  # Opening the microphone is not a new utterance or an ASR result wait.
+  runtime.cancel('开始监听',abort=False)
+  await runtime.pulse()
 
 
 @optional_hook
@@ -333,11 +417,15 @@ async def voice_activity(conn,have_voice=True,asr_pending=False):
  if not runtime:return
  now=time.time()
  if have_voice:
-  if now>runtime.voice_until:
+  edge=not runtime.input_open or runtime.input_phase=='waiting'
+  previous=runtime.input_token;runtime.voice_seen(now)
+  if runtime.input_token!=previous:conn.client_voice_stop=False
+  if edge:
    for peer in list(_REGISTRY):
     if peer.same_subject(runtime):peer.cancel('用户开始说话')
-  runtime.voice_until=now+2;runtime.idle_since=now
- if asr_pending:runtime.asr_pending=True
+ else:
+  runtime.last_frame_voice=False
+  if asr_pending:runtime.wait_for_input(now)
  if now-runtime.last_voice_write>=.5:
   runtime.last_voice_write=now;await runtime.pulse()
 

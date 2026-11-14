@@ -33,13 +33,13 @@ class ListenTextMessageHandler(TextMessageHandler):
                 f"客户端拾音模式：{conn.client_listen_mode}"
             )
         if msg_json["state"] == "start":
-            from core.utils.companion_initiative import voice_activity
-            await voice_activity(conn)
+            from core.utils.companion_initiative import listen_started
+            await listen_started(conn)
             # 设备从播放模式切回录音模式,清除所有音频状态和缓冲区
             conn.reset_audio_states()
         elif msg_json["state"] == "stop":
             initiative=getattr(conn,'_initiative_runtime',None)
-            if initiative and initiative.voice_until>time.time():
+            if initiative and initiative.input_open:
                 from core.utils.companion_initiative import voice_activity
                 await voice_activity(conn,have_voice=False,asr_pending=True)
             # 收到stop但asr未初始化，跳过处理
