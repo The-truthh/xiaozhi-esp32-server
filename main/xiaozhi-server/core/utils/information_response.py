@@ -10,6 +10,19 @@ from datetime import datetime, timedelta
 from core.utils.information_lookup import TZ, InformationLookup
 
 
+def memory_role_candidate(conn, messages):
+    """A bounded role utterance, buffered for delivery-time memory validation.
+
+    Formatting checks here do not claim semantic verification. Core identity,
+    unknown reads and original-wording requests use protected response paths.
+    """
+    candidate = ''.join(conn.llm.response(conn.session_id, messages, max_tokens=256)).strip()
+    if (candidate and len(candidate) <= 220 and candidate[-1] in '。！？!?.”」'
+            and not re.search(r'[()（）\[\]【】`]|\*\*|^小圆(?:的|[:：])', candidate)):
+        return candidate
+    return None
+
+
 def brief(text, limit=150, count=3):
     parts=re.findall(r'[^。！？!?\n]+[。！？!?]?', str(text))
     selected=[];size=0

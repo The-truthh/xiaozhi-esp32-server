@@ -184,6 +184,28 @@ class MemoryProvider(MemoryProviderBase):
             raise PermissionError('Personal memory is unavailable for this device')
         return self._managed.answer_identity(field)
 
+    @property
+    def layered_context(self):
+        return bool(getattr(self, 'managed', False) and not self._memory_scope_denied
+                    and self._managed and self._managed.layered_context)
+
+    @property
+    def character_interests(self):
+        return self.layered_context and self._managed.character_interests
+
+    def core_context(self):
+        if not self.layered_context:
+            raise PermissionError('Core memory is unavailable for this device')
+        return self._managed.core_context()
+
+    def core_context_current(self, snapshot):
+        return self.layered_context and self._managed.core_context_current(snapshot)
+
+    def read_facts(self, selection, read_status='ok'):
+        if self._memory_scope_denied or not getattr(self, 'managed', False) or not self._managed:
+            raise PermissionError('Personal memory is unavailable for this device')
+        return self._managed.read_facts(selection, read_status)
+
     def query_catalog(self):
         if self._memory_scope_denied or not getattr(self, 'managed', False) or not self._managed:
             raise PermissionError('Personal memory is unavailable for this device')

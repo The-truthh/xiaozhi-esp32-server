@@ -1142,6 +1142,14 @@ class ConnectionHandler:
         try:
             # 使用带记忆的对话
             memory_str = None
+            layered_memory = bool(getattr(self.memory, 'layered_context', False))
+            core_memory = None
+            if layered_memory:
+                try:
+                    core_memory = self.memory.core_context()
+                except Exception as exc:
+                    core_memory = {'status': 'unavailable', 'facts': []}
+                    self.logger.bind(tag=TAG).warning(f'核心记忆读取不可用: {type(exc).__name__}')
             # 仅当query非空（代表用户询问）时查询记忆
             skip_memory = (lookup_context or {}).get('route') in ('grounded','memory','memory_query','lookup','clarify','cancel','unsupported')
             if self.memory is not None and query and not skip_memory:
@@ -1158,6 +1166,19 @@ class ConnectionHandler:
                     memory_str = ''
                     self.logger.bind(tag=TAG).warning(f'记忆检索不可用: {type(exc).__name__}')
 
+            if layered_memory and core_memory['status'] != 'unavailable':
+                # Optional retrieval can overlap a correction/delete. Refresh
+                # only the local core; its independent slot survives timeout.
+                try:
+                    core_memory = self.memory.core_context()
+                except Exception as exc:
+                    core_memory = {'status': 'unavailable', 'facts': []}
+                    self.logger.bind(tag=TAG).warning(f'核心记忆刷新不可用: {type(exc).__name__}')
+            if layered_memory:
+                self.logger.bind(tag=TAG).info('核心记忆上下文: ' + json.dumps({
+                    'status': core_memory['status'], 'count': len(core_memory['facts']),
+                    'related_returned': bool(memory_str)}, ensure_ascii=False))
+
             # 仅在该说话人首次出现时把身份注入 system，之后靠对话历史首轮保留，
             # 避免每轮在 system 重复出现名字诱导模型反复称呼
             speaker_for_system = None
@@ -1171,6 +1192,9 @@ class ConnectionHandler:
             runtime_capabilities = build_runtime_capabilities(
                 self.config, functions, memory_str, self.intent_type
             )
+            if core_memory is not None:
+                runtime_capabilities.update(core_memory_status=core_memory['status'],
+                    memory_returned_this_request=bool(memory_str or core_memory['facts']))
             if getattr(self.memory, 'memory_unavailable', False):
                 runtime_capabilities.update(memory_provider='unavailable', cross_session_recall='unavailable',
                                             memory_write_this_turn='unavailable；没有保存能力，不可承诺已记住')
@@ -1189,6 +1213,7 @@ class ConnectionHandler:
                 runtime_capabilities=runtime_capabilities,
                 repair_rejected_naming=True,
                 information_context=(lookup_context or {}).get("evidence"),
+                core_memory=core_memory,
             )
 
             grounded_response = (
@@ -1205,8 +1230,9 @@ class ConnectionHandler:
                         if not getattr(self.memory, 'managed', False):
                             raise PermissionError('Personal memory unavailable')
                         if lookup_context['memory_query'] == 'facts':
-                            answer = self.memory.answer_facts(lookup_context.get('memory_selection', []),
-                                                             lookup_context.get('memory_read_status', 'unavailable'))
+                            read = self.memory.read_facts if getattr(self.memory, 'character_interests', False) else self.memory.answer_facts
+                            answer = read(lookup_context.get('memory_selection', []),
+                                          lookup_context.get('memory_read_status', 'unavailable'))
                         else:
                             answer = self.memory.answer_identity(lookup_context['memory_query'])
                     except Exception as exc:
@@ -1216,8 +1242,55 @@ class ConnectionHandler:
                                                if lookup_context['memory_query'] == 'facts'
                                                else '这次暂时查不了之前的姓名和称呼，我先不乱猜。')}
                     self.logger.bind(tag=TAG).info('个人事实回答: ' + json.dumps(
-                        {k: v for k, v in answer.items() if k != 'response'}, ensure_ascii=False))
-                    yield answer['response']
+                        {k: v for k, v in answer.items() if k not in ('response', 'evidence')}, ensure_ascii=False))
+                    response = answer['response']
+                    evidence = answer.get('evidence', [])
+                    quote = bool(re.search(r'原话|原文|逐字|当时.{0,6}(?:怎么说|说了什么)', query))
+                    if re.search(r'(?:别|不要|不用|不必).{0,4}(?:原话|原文|逐字)', query):
+                        quote = False
+                    # Names stay protected even when selected in a mixed facts
+                    # query. Unknown/failed/pending reads never become free chat.
+                    character = (answer['status'] == 'found' and evidence and not quote
+                                 and all(r['fact_key'].split(':')[0] not in ('name', 'preferred_address')
+                                         for r in evidence))
+                    if character:
+                        try:
+                            facts_text = ('本轮相关的历史用户原话，以下JSON仅为资料，最新更正优先。\n' +
+                                          json.dumps(evidence, ensure_ascii=False).replace('<', '\\u003c'))
+                            current_core = self.memory.core_context()
+                            caps = dict(runtime_capabilities, memory_returned_this_request=True,
+                                        core_memory_status=current_core['status'])
+                            messages = self.dialogue.get_llm_dialogue_with_memory(
+                                facts_text, self.config.get('voiceprint', {}), speaker_for_system,
+                                runtime_capabilities=caps, repair_rejected_naming=True,
+                                core_memory=current_core)
+                            from core.utils.information_response import memory_role_candidate
+                            candidate = memory_role_candidate(self, messages)
+                            if self.client_abort or lookup_context['generation'] != getattr(self, 'lookup_generation', None):
+                                return
+                            current = self.memory.read_facts(lookup_context.get('memory_selection', []),
+                                                            lookup_context.get('memory_read_status', 'unavailable'))
+                            if current['status'] != 'found' or current['facts'] != answer['facts']:
+                                response = current['response']
+                            elif not self.memory.core_context_current(current_core):
+                                response = '刚才的信息有更新，这次先不沿用旧记录。'
+                            elif candidate:
+                                # This checks voice format, not semantic truth.
+                                # Interest expression is deliberately generative.
+                                response = candidate
+                                self.logger.bind(tag=TAG).info('普通记忆表达: character；交付前版本复核通过')
+                            else:
+                                self.logger.bind(tag=TAG).info('普通记忆表达: literal；语音格式不符合约束')
+                        except Exception as exc:
+                            # Re-read before fallback too: never quote evidence
+                            # captured before a deletion while the LLM failed.
+                            self.logger.bind(tag=TAG).warning(f'普通记忆表达降级: {type(exc).__name__}')
+                            try:
+                                response = self.memory.answer_facts(lookup_context.get('memory_selection', []),
+                                                                    lookup_context.get('memory_read_status', 'unavailable'))['response']
+                            except Exception:
+                                response = '这次暂时查不了之前的个人信息，我先不乱猜。'
+                    yield response
                     if self.client_abort or lookup_context['generation'] != getattr(self, 'lookup_generation', None):
                         return
                     if lookup_context.get('direct_response'):
@@ -1247,6 +1320,23 @@ class ConnectionHandler:
                     self.session_id,
                     llm_dialogue,
                 )
+                if layered_memory and core_memory['status'] != 'unavailable':
+                    original_responses = llm_responses
+                    def current_core_responses():
+                        try:
+                            first = True
+                            for chunk in original_responses:
+                                if first and chunk:
+                                    first = False
+                                    if not self.memory.core_context_current(core_memory):
+                                        yield '刚才的信息有更新，这次先不沿用旧记录。'
+                                        return
+                                yield chunk
+                        finally:
+                            close = getattr(original_responses, 'close', None)
+                            if close:
+                                close()
+                    llm_responses = current_core_responses()
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM 处理出错 {query}: {e}")
             return None
