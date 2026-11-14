@@ -12,7 +12,7 @@ test_volume="$run_id-data"
 build_name="$run_id-build"
 cache_volume=xiaozhi-miniapp-maven-cache
 maven_image=maven:3.9.9-eclipse-temurin-21
-report_dir="$repo_root/research/miniapp_backend_2026-10-21/runs/$run_id"
+report_dir="${MINIAPP_TEST_REPORT_DIR:-$repo_root/main/manager-api/.test-reports/$run_id}"
 mkdir -p "$report_dir"
 
 docker_cmd=(docker)
