@@ -24,6 +24,14 @@ async def handleAudioMessage(conn: "ConnectionHandler", pcm_frame):
         if not hasattr(conn, "vad_resume_task") or conn.vad_resume_task.done():
             conn.vad_resume_task = asyncio.create_task(resume_vad_detection(conn))
         return
+    if have_voice:
+        from core.utils.companion_initiative import voice_activity
+        await voice_activity(conn)
+    elif getattr(conn,'client_voice_stop',False):
+        initiative=getattr(conn,'_initiative_runtime',None)
+        if initiative and initiative.voice_until>time.time():
+            from core.utils.companion_initiative import voice_activity
+            await voice_activity(conn,have_voice=False,asr_pending=True)
     # 服务端AEC功能需要实时触发打断
     if conn.client_aec and have_voice:
         if conn.client_is_speaking and conn.client_listen_mode != "manual":
@@ -93,6 +101,12 @@ async def startToChat(conn: "ConnectionHandler", text, origin="asr"):
         if conn.client_is_speaking:
             # A new completed turn (including "不查了") supersedes this workflow.
             await handleAbortMessage(conn)
+        from datetime import datetime, timezone
+        import uuid
+        event = {'id': uuid.uuid4().hex, 'role': 'user', 'text': actual_text,
+                 'origin': origin, 'observed_at': datetime.now(timezone.utc).isoformat()}
+        from core.utils.companion_initiative import user_input
+        await user_input(conn,event)
         from core.handle.intentHandler import check_direct_exit
         from core.utils.util import remove_punctuation_and_length
         _, exit_text = remove_punctuation_and_length(actual_text)
@@ -102,10 +116,6 @@ async def startToChat(conn: "ConnectionHandler", text, origin="asr"):
         if not hasattr(conn, "information_session"):
             conn.information_session = ReadOnlySession(conn)
         await send_stt_message(conn, actual_text)
-        from datetime import datetime, timezone
-        import uuid
-        event = {'id': uuid.uuid4().hex, 'role': 'user', 'text': actual_text,
-                 'origin': origin, 'observed_at': datetime.now(timezone.utc).isoformat()}
         conn.information_session.submit(actual_text, event)
         return
 

@@ -270,7 +270,8 @@ def prepare_affect_turn(conn, packet, query, sentence_id):
     if not selected:
         cancel_affect_turn(conn)
         return None
-    if (packet or {}).get('input_origin') not in ('asr', 'user_text'):
+    if ((packet or {}).get('input_origin') not in ('asr', 'user_text')
+            and not ((packet or {}).get('input_origin')=='initiative' and (packet or {}).get('initiative_opportunity'))):
         return None
     try:
         scope, engine, policy = selected
@@ -297,7 +298,9 @@ def prepare_affect_turn(conn, packet, query, sentence_id):
         from core.utils.information_router import speech
         turns = [dict(role=m.role, content=str(m.content or '')[:1000]) for m in conn.dialogue.dialogue
                  if m.role in ('user', 'assistant') and not m.is_temporary and not m.is_runtime_event][-5:]
-        bundle = (runtime, ticket, {'user': speech(query)[:3000], 'history': turns, 'delivery_status': 'generated',
+        bundle = (runtime, ticket, {'user': speech(query)[:3000] if query is not None else '',
+                                    'input_origin':(packet or {}).get('input_origin'),
+                                    'history': turns, 'delivery_status': 'generated',
                                     'application_version': 'q2-v2'})
         tickets[sentence_id] = bundle
         while len(tickets) > 8:

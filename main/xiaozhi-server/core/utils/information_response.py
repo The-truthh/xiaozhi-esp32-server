@@ -176,8 +176,13 @@ def _compose_reply(conn, messages, data, draft):
     payload['delivery_requirements'] = {'required_exact_quotations':required_quotes,
         'news_titles_in_original_order':titles, 'news_numbers':expected,
         'unknown_information_is_not_proof_user_never_said_it':True}
+    initiative=bool(data.get('initiative_opportunity'))
+    author_rules=''
+    if initiative:
+        from core.utils.companion_initiative import AUTHOR_RULES
+        author_rules=AUTHOR_RULES
     for attempt in range(2):
-        raw = conn.intent.llm.response_structured(messages[0]['content']+'\n'+REVIEW_RULES,
+        raw = conn.intent.llm.response_structured(messages[0]['content']+'\n'+REVIEW_RULES+author_rules,
             json.dumps(payload,ensure_ascii=False), REVIEW_SCHEMA, timeout=8)
         try:
             result = json.loads(raw)
@@ -188,6 +193,10 @@ def _compose_reply(conn, messages, data, draft):
                     or not isinstance(result['news_numbers'],list)
                     or any(type(n) is not int for n in result['news_numbers'])):
                 raise ValueError('Invalid response composition')
+            if initiative:
+                from core.utils.companion_initiative import SILENT
+                if result['reply'].strip()==SILENT:return None,result
+                if SILENT in result['reply']:raise ValueError('Mixed initiative control signal')
             answer = _spoken(result['reply'])
             if q4_enabled and spoken_format_feedback(answer):
                 raise ValueError(spoken_format_feedback(answer))
@@ -257,6 +266,7 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
     from core.utils.companion_expression import render_expression_messages, select_dialogue_policy
     topic_turn = prepare_topic_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
     def current():
+        if packet.get('initiative_cancelled'):return False
         if direct:
             from core.utils.companion_response import reply_is_current
             return reply_is_current(conn, packet, sentence_id)
@@ -339,6 +349,8 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
                 'write_receipt':'queued' if packet.get('memory_job') else 'none',
                 'history_coverage':'partial',
                 'local_time':datetime.now(TZ).isoformat()}
+        if packet.get('initiative_opportunity'):
+            data['initiative_opportunity']=packet['initiative_opportunity']
         from core.utils.runtime_capabilities import build_runtime_capabilities
         capabilities = dict(runtime_capabilities or build_runtime_capabilities(
             conn.config, intent_type=getattr(conn, 'intent_type', None),
@@ -368,7 +380,7 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
         try:
             if direct:
                 from core.utils.companion_response import build_reply_messages, generate_role_reply
-                request = build_reply_messages(conn, data, reply_policy, speaker)
+                request = build_reply_messages(conn, data, reply_policy, speaker,initiative=bool(packet.get('initiative_opportunity')))
                 answer = generate_role_reply(conn, request, reply_policy, packet, sentence_id)
                 if answer is None:
                     return
@@ -380,6 +392,9 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
                                            or messages[-1].get('content') != query):
                     messages.append({'role':'user','content':query})
                 context = TURN_RULES+'\n<current_turn_data>\n'+json.dumps(data,ensure_ascii=False).replace('<','\\u003c')+'\n</current_turn_data>'
+                if packet.get('initiative_opportunity'):
+                    from core.utils.companion_initiative import AUTHOR_RULES
+                    context += AUTHOR_RULES
                 position = len(messages)-1 if messages and messages[-1]['role']=='user' else len(messages)
                 messages.insert(position, {'role':'system','content':context})
                 messages = render_expression_messages(conn, messages)
@@ -403,6 +418,7 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
             if not current():return
             if not direct:
                 answer, review = _compose_reply(conn,messages,data,draft)
+                if answer is None:return
             if not current():return
             if managed and token is not None and token != memory.delivery_token(references):
                 conn.logger.bind(tag='natural_response').info('事实版本变化，重新读取并生成')

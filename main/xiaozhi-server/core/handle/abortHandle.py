@@ -10,6 +10,11 @@ TAG = __name__
 
 async def handleAbortMessage(conn: "ConnectionHandler"):
     conn.logger.bind(tag=TAG).info("Abort message received")
+    initiative=getattr(conn,'_initiative_runtime',None)
+    if initiative:
+        initiative.cancel('收到打断',abort=False)
+        initiative.normal_busy=False
+        initiative.asr_pending=False
     # 设置成打断状态，会自动打断llm、tts任务
     conn.close_after_chat = False
     conn.client_abort = True

@@ -316,7 +316,8 @@ class Store:
             # cannot restore them after the epoch change.
             for table in ('companion_affect', 'companion_affect_events', 'companion_episodes',
                           'companion_episode_sources', 'companion_episode_jobs', 'companion_episode_audit',
-                          'companion_topics'):
+                          'companion_topics', 'companion_initiative_subjects',
+                          'companion_initiative_presence', 'companion_initiative_candidates'):
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                     db.execute('DELETE FROM ' + table + ' WHERE scope=?', (scope,))
             # Every old extraction job is fenced; even old sources can no longer

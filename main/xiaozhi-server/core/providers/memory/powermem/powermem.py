@@ -230,6 +230,21 @@ class MemoryProvider(MemoryProviderBase):
         if not self.recent_context_enabled:return {'status':'unavailable','turns':[]}
         return self._managed.recent_context(session_id)
 
+    def read_companion_episodes(self, companion_id, query, **kwargs):
+        if self._memory_scope_denied or not getattr(self,'managed',False) or not self._managed:
+            raise PermissionError('Episode subject is unavailable')
+        return self._managed.read_companion_episodes(companion_id,query,**kwargs)
+
+    def companion_episode_records(self, companion_id, **kwargs):
+        if self._memory_scope_denied or not getattr(self,'managed',False) or not self._managed:
+            raise PermissionError('Episode subject is unavailable')
+        return self._managed.companion_episode_records(companion_id,**kwargs)
+
+    def maintain_companion_episode(self, companion_id, identifier, revision, **kwargs):
+        if self._memory_scope_denied or not getattr(self,'managed',False) or not self._managed:
+            raise PermissionError('Episode subject is unavailable')
+        return self._managed.maintain_companion_episode(companion_id,identifier,revision,**kwargs)
+
     def record_recent_user(self, event, session_id):
         if self.recent_context_enabled:return self._managed.record_recent_user(event,session_id)
 

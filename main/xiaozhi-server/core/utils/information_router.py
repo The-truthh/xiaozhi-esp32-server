@@ -422,7 +422,9 @@ class ReadOnlySession:
             packet["route"] = plan["route"]
             self.last_trace = trace
             self.conn.logger.bind(tag="information_router").info("只读信息路由: " + json.dumps(trace, ensure_ascii=False))
-            self.conn.executor.submit(self.conn.chat, text, 0, packet)
+            future=self.conn.executor.submit(self.conn.chat, text, 0, packet)
+            from core.utils.companion_initiative import reply_submitted
+            reply_submitted(self.conn,memory_event,packet,future)
         except asyncio.CancelledError:
             return
         except Exception as exc:
@@ -438,4 +440,6 @@ class ReadOnlySession:
                 if natural_response_enabled(self.conn):
                     packet['operation'] = {'kind':'route','status':'unavailable'}
                 else:packet['direct_response'] = "刚才处理出了点问题，您再说一遍好吗？"
-                self.conn.executor.submit(self.conn.chat, text, 0, packet)
+                future=self.conn.executor.submit(self.conn.chat, text, 0, packet)
+                from core.utils.companion_initiative import reply_submitted
+                reply_submitted(self.conn,memory_event,packet,future)

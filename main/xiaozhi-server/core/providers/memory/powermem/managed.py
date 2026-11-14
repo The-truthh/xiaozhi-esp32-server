@@ -478,6 +478,23 @@ class ManagedMemory:
         if not self.recent_context_enabled:return {'status':'disabled','turns':[]}
         return self.engine.store.recent_snapshot(self.scope,session_id)
 
+    def read_companion_episodes(self, companion_id, query, *, expected_scope=None, **kwargs):
+        if not self.scope or (expected_scope is not None and self.scope!=expected_scope):
+            raise PermissionError('Episode subject is unavailable')
+        from core.utils.companion_store import EpisodeStore
+        from core.utils.companion_memory import read_episode_context
+        return read_episode_context(EpisodeStore(self.engine.store),self.scope,companion_id,query,**kwargs)
+
+    def companion_episode_records(self, companion_id, *, include_withdrawn=False):
+        if not self.scope:raise PermissionError('Episode subject is unavailable')
+        from core.utils.companion_store import EpisodeStore
+        return EpisodeStore(self.engine.store).episode_records(self.scope,companion_id,include_withdrawn=include_withdrawn)
+
+    def maintain_companion_episode(self, companion_id, identifier, revision, **kwargs):
+        if not self.scope:raise PermissionError('Episode subject is unavailable')
+        from core.utils.companion_store import EpisodeStore
+        return EpisodeStore(self.engine.store).maintain_episode(self.scope,companion_id,identifier,revision,**kwargs)
+
     async def query_memory(self,query):
         return await self.engine.recall(self.scope,query)
 

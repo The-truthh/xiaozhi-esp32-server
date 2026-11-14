@@ -517,3 +517,163 @@ class TopicStore(CompanionStore):
                     old=db.execute('SELECT revision,status FROM companion_episodes WHERE id=? AND epoch=?',(source,epoch)).fetchone()
                     if not old or old['revision']!=source_revision or old['status']!='active':return False
             return True
+
+
+class InitiativeStore(CompanionStore):
+    """Shared subject controls, short presence leases and consumed opportunities.
+
+    A commit consumes an opportunity before audio enqueue. A crash may lose
+    that utterance; a second terminal must not replay it as if never delivered.
+    """
+    def __init__(self,ledger):
+        super().__init__(ledger,initialize_affect=False)
+        with self.db() as db:
+            db.executescript('''CREATE TABLE IF NOT EXISTS companion_initiative_subjects(
+                scope TEXT NOT NULL,companion_id TEXT NOT NULL,epoch INTEGER NOT NULL,
+                user_seq INTEGER NOT NULL DEFAULT 0,last_user_at REAL NOT NULL DEFAULT 0,
+                last_session TEXT NOT NULL DEFAULT '',last_event TEXT NOT NULL DEFAULT '',last_text TEXT NOT NULL DEFAULT '',
+                last_route TEXT NOT NULL DEFAULT '',quiet_until REAL NOT NULL DEFAULT 0,quiet_quote TEXT NOT NULL DEFAULT '',
+                last_attempt_at REAL NOT NULL DEFAULT 0,last_spoken_at REAL NOT NULL DEFAULT 0,last_delivered_seq INTEGER NOT NULL DEFAULT -1,
+                PRIMARY KEY(scope,companion_id));
+                CREATE TABLE IF NOT EXISTS companion_initiative_presence(
+                scope TEXT NOT NULL,companion_id TEXT NOT NULL,session_id TEXT NOT NULL,epoch INTEGER NOT NULL,
+                device_id TEXT NOT NULL,expires_at REAL NOT NULL,busy INTEGER NOT NULL,voice_until REAL NOT NULL,
+                PRIMARY KEY(scope,companion_id,session_id));
+                CREATE TABLE IF NOT EXISTS companion_initiative_candidates(
+                id TEXT PRIMARY KEY,scope TEXT NOT NULL,companion_id TEXT NOT NULL,epoch INTEGER NOT NULL,user_seq INTEGER NOT NULL,
+                owner TEXT NOT NULL,topic_key TEXT NOT NULL,source_kind TEXT NOT NULL,source_id TEXT NOT NULL,source_revision INTEGER NOT NULL,
+                payload TEXT NOT NULL,created_at REAL NOT NULL,deadline REAL NOT NULL,status TEXT NOT NULL,
+                turn_id TEXT NOT NULL DEFAULT '',reply_text TEXT NOT NULL DEFAULT '',completed_at REAL,
+                UNIQUE(scope,companion_id,epoch,user_seq));
+                CREATE INDEX IF NOT EXISTS initiative_recent ON companion_initiative_candidates(scope,companion_id,created_at);''')
+            # Remain forget-safe after a code rollback: old binaries already
+            # advance scopes.epoch but do not know the new derived tables.
+            for table in ('companion_affect','companion_affect_events','companion_episodes',
+                    'companion_episode_sources','companion_episode_jobs','companion_episode_audit',
+                    'companion_topics','companion_initiative_subjects','companion_initiative_presence',
+                    'companion_initiative_candidates'):
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
+                    db.executescript('CREATE TRIGGER IF NOT EXISTS forget_'+table+' AFTER UPDATE OF epoch ON scopes '
+                        'WHEN NEW.epoch!=OLD.epoch BEGIN DELETE FROM '+table+' WHERE scope=NEW.scope; END;')
+
+    def _subject(self,db,scope,companion):
+        epoch=self.ledger._epoch(db,scope)
+        old=db.execute('SELECT epoch FROM companion_initiative_subjects WHERE scope=? AND companion_id=?',(scope,companion)).fetchone()
+        if old and old['epoch']!=epoch:
+            # An older binary may have advanced the factual epoch without
+            # knowing these optional tables. Never revive its stale sources.
+            for table in ('companion_initiative_candidates','companion_initiative_presence','companion_initiative_subjects'):
+                db.execute('DELETE FROM '+table+' WHERE scope=? AND companion_id=?',(scope,companion))
+        db.execute('INSERT OR IGNORE INTO companion_initiative_subjects(scope,companion_id,epoch) VALUES(?,?,?)',(scope,companion,epoch))
+        row=db.execute('SELECT * FROM companion_initiative_subjects WHERE scope=? AND companion_id=?',(scope,companion)).fetchone()
+        return dict(row)
+
+    def read_subject(self,scope,companion):
+        with self.db() as db:return self._subject(db,scope,companion)
+
+    def user_input(self,scope,companion,session,event,text,quiet=None,quiet_ttl=3600,stamp=None):
+        now=time.time() if stamp is None else stamp
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE');row=self._subject(db,scope,companion)
+            if row['last_event']==event:return row
+            until=row['quiet_until'];quote=row['quiet_quote']
+            if quiet is True:until=now+quiet_ttl;quote=text[:500]
+            elif quiet is False:until=0;quote=''
+            db.execute('UPDATE companion_initiative_subjects SET user_seq=user_seq+1,last_user_at=?,last_session=?,last_event=?,last_text=?,last_route=?,quiet_until=?,quiet_quote=? WHERE scope=? AND companion_id=?',
+                (now,session,event,text[:1000],'pending',until,quote,scope,companion))
+            db.execute("UPDATE companion_initiative_candidates SET status='cancelled' WHERE scope=? AND companion_id=? AND status IN ('leased','committed')",(scope,companion))
+            return dict(db.execute('SELECT * FROM companion_initiative_subjects WHERE scope=? AND companion_id=?',(scope,companion)).fetchone())
+
+    def route_result(self,scope,companion,event,route):
+        with self.db() as db:db.execute('UPDATE companion_initiative_subjects SET last_route=? WHERE scope=? AND companion_id=? AND last_event=?',(route,scope,companion,event))
+
+    def presence(self,scope,companion,session,device,busy,voice_until,ttl,stamp=None):
+        now=time.time() if stamp is None else stamp
+        with self.db() as db:
+            epoch=self.ledger._epoch(db,scope)
+            db.execute('INSERT OR REPLACE INTO companion_initiative_presence VALUES(?,?,?,?,?,?,?,?)',
+                (scope,companion,session,epoch,device,now+ttl,int(busy),voice_until))
+            db.execute('DELETE FROM companion_initiative_presence WHERE scope=? AND companion_id=? AND expires_at<=?',(scope,companion,now))
+
+    def _ready(self,db,row,session,now,delivery=False):
+        own=db.execute('SELECT * FROM companion_initiative_presence WHERE scope=? AND companion_id=? AND session_id=? AND epoch=? AND expires_at>?',
+            (row['scope'],row['companion_id'],session,row['epoch'],now)).fetchone()
+        if not own or own['voice_until']>now or (own['busy'] and not delivery):return False
+        return not db.execute('SELECT 1 FROM companion_initiative_presence WHERE scope=? AND companion_id=? AND epoch=? AND session_id!=? AND expires_at>? AND (busy=1 OR voice_until>?) LIMIT 1',
+            (row['scope'],row['companion_id'],row['epoch'],session,now,now)).fetchone()
+
+    def _source_current(self,db,candidate):
+        kind=candidate['source_kind'];identifier=candidate['source_id'];revision=candidate['source_revision']
+        if kind=='user':
+            s=self._subject(db,candidate['scope'],candidate['companion_id'])
+            return identifier==s['last_event'] and revision==s['user_seq']
+        table='companion_topics' if kind=='topic' else 'companion_episodes' if kind=='episode' else None
+        if not table or not db.execute("SELECT 1 FROM sqlite_master WHERE name=? AND type='table'",(table,)).fetchone():return False
+        r=db.execute('SELECT * FROM '+table+' WHERE id=? AND scope=? AND companion_id=? AND epoch=?',
+            (identifier,candidate['scope'],candidate['companion_id'],candidate['epoch'])).fetchone()
+        return bool(r and r['revision']==revision and r['status'] in ('pending','active')
+            and (kind!='topic' or r['is_current']))
+
+    def claim(self,scope,companion,session,material,*,silence,cooldown,ttl,source_age,max_per_session,topic_cooldown,stamp=None):
+        now=time.time() if stamp is None else stamp
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE');s=self._subject(db,scope,companion)
+            if (s['last_session']!=session or s['user_seq']<=0 or s['last_route'] not in ('chat','grounded')
+                    or now-s['last_user_at']<silence or now-s['last_user_at']>source_age or s['quiet_until']>now
+                    or (s['last_attempt_at'] and now-s['last_attempt_at']<cooldown) or s['last_delivered_seq']>=s['user_seq']
+                    or not self._ready(db,s,session,now)):return None
+            db.execute("UPDATE companion_initiative_candidates SET status='expired' WHERE scope=? AND companion_id=? AND status IN ('leased','committed') AND deadline<=?",(scope,companion,now))
+            if db.execute('SELECT 1 FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND epoch=? AND user_seq=?',
+                (scope,companion,s['epoch'],s['user_seq'])).fetchone():return None
+            used=db.execute("SELECT count(*) FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND owner=? AND turn_id!=''",
+                (scope,companion,session)).fetchone()[0]
+            if used>=max_per_session:return None
+            if db.execute("SELECT 1 FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND topic_key=? AND created_at>? AND turn_id!='' LIMIT 1",
+                (scope,companion,material['topic_key'],now-topic_cooldown)).fetchone():return None
+            identifier=hashlib.sha256(json.dumps([scope,companion,s['epoch'],s['user_seq']]).encode()).hexdigest()
+            material=dict(material,topic_id=material['topic_key'],expires_at=now+ttl,
+                pause_elapsed_seconds=round(now-s['last_user_at'],1),no_new_user_message=True,
+                source_refs=[dict(kind=material['source_kind'],id=material['source_id'],revision=material['source_revision'])])
+            item=dict(id=identifier,scope=scope,companion_id=companion,epoch=s['epoch'],user_seq=s['user_seq'],owner=session,
+                topic_key=material['topic_key'],source_kind=material['source_kind'],source_id=material['source_id'],source_revision=material['source_revision'],
+                payload=json.dumps(material,ensure_ascii=False),created_at=now,deadline=now+ttl,status='leased')
+            if not self._source_current(db,item):return None
+            db.execute('INSERT INTO companion_initiative_candidates('+','.join(item)+') VALUES('+','.join('?' for _ in item)+')',tuple(item.values()))
+            db.execute('UPDATE companion_initiative_subjects SET last_attempt_at=? WHERE scope=? AND companion_id=?',(now,scope,companion))
+            db.execute('DELETE FROM companion_initiative_candidates WHERE scope=? AND companion_id=? AND created_at<? AND status NOT IN (?,?)',
+                (scope,companion,now-86400*7,'leased','committed'))
+            item['material']=material;return item
+
+    def current(self,ticket,*,delivery=False,stamp=None):
+        now=time.time() if stamp is None else stamp
+        with self.db() as db:
+            s=self._subject(db,ticket['scope'],ticket['companion_id'])
+            row=db.execute('SELECT * FROM companion_initiative_candidates WHERE id=?',(ticket['id'],)).fetchone()
+            return bool(row and row['status']==('committed' if delivery else 'leased') and row['deadline']>now
+                and s['epoch']==ticket['epoch'] and s['user_seq']==ticket['user_seq'] and s['last_session']==ticket['owner']
+                and s['quiet_until']<=now and self._source_current(db,ticket) and self._ready(db,s,ticket['owner'],now,delivery))
+
+    def commit(self,ticket,turn,text,stamp=None):
+        now=time.time() if stamp is None else stamp
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE');s=self._subject(db,ticket['scope'],ticket['companion_id'])
+            row=db.execute('SELECT * FROM companion_initiative_candidates WHERE id=?',(ticket['id'],)).fetchone()
+            if not (row and row['status']=='leased' and row['deadline']>now and s['epoch']==ticket['epoch']
+                    and s['user_seq']==ticket['user_seq'] and s['last_session']==ticket['owner'] and s['quiet_until']<=now
+                    and self._source_current(db,ticket) and self._ready(db,s,ticket['owner'],now)):return False
+            db.execute("UPDATE companion_initiative_candidates SET status='committed',turn_id=?,reply_text=? WHERE id=?",(turn,text,ticket['id']))
+            db.execute('UPDATE companion_initiative_subjects SET last_spoken_at=?,last_delivered_seq=? WHERE scope=? AND companion_id=?',
+                (now,ticket['user_seq'],ticket['scope'],ticket['companion_id']))
+            return True
+
+    def settle(self,ticket,status,stamp=None):
+        if status not in ('skipped','cancelled','failed','audio_sent','interrupted'):raise ValueError('Invalid initiative status')
+        with self.db() as db:
+            allowed=('leased','committed','audio_sent') if status=='interrupted' else ('leased','committed')
+            db.execute('UPDATE companion_initiative_candidates SET status=?,completed_at=? WHERE id=? AND epoch=? AND status IN ('+','.join('?' for _ in allowed)+')',
+                (status,time.time() if stamp is None else stamp,ticket['id'],ticket['epoch'],*allowed))
+
+    def disconnect(self,scope,companion,session):
+        with self.db() as db:
+            db.execute('DELETE FROM companion_initiative_presence WHERE scope=? AND companion_id=? AND session_id=?',(scope,companion,session))
+            db.execute("UPDATE companion_initiative_candidates SET status='cancelled' WHERE scope=? AND companion_id=? AND owner=? AND status='leased'",(scope,companion,session))

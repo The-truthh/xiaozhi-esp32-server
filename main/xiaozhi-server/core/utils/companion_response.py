@@ -99,6 +99,8 @@ def select_reply_policy(conn):
 
 
 def reply_is_current(conn, packet, sentence_id=None):
+    if (packet or {}).get('initiative_cancelled'):
+        return False
     if getattr(conn, 'client_abort', False):
         return False
     if sentence_id is not None and getattr(conn, 'sentence_id', None) != sentence_id:
@@ -119,7 +121,7 @@ def _history_groups(messages):
     return groups
 
 
-def build_reply_messages(conn, data, policy, speaker=None):
+def build_reply_messages(conn, data, policy, speaker=None, initiative=False):
     """Bound optional context without slicing a correction, selected fact or tool chain.
 
     The latest two user turns are protected. A hard overflow fails explicitly;
@@ -139,7 +141,7 @@ def build_reply_messages(conn, data, policy, speaker=None):
             history[-1]['content'] = current
         else:
             history.append({'role': 'user', 'content': current})
-    if not system or not history or history[-1]['role'] != 'user':
+    if not system or not history or (not initiative and history[-1]['role'] != 'user'):
         raise ValueError('Missing persona or current user turn')
     from core.utils.companion_expression import render_expression_messages, select_dialogue_policy
     system = render_expression_messages(conn, system)
@@ -147,6 +149,9 @@ def build_reply_messages(conn, data, policy, speaker=None):
     if select_dialogue_policy(conn):
         from core.utils.companion_topics import ROLE_TOPIC_RULES
         rules += ROLE_TOPIC_RULES
+    if initiative:
+        from core.utils.companion_initiative import AUTHOR_RULES
+        rules += AUTHOR_RULES
 
     context = deepcopy(data)
     context.pop('current_user_utterance', None)  # Already the actual final user message.
@@ -166,7 +171,7 @@ def build_reply_messages(conn, data, policy, speaker=None):
         selected = [m for group in groups for m in group]
         block = {'role': 'system', 'content': rules + '\n<turn_context>\n'
                  + _serialize(context) + '\n</turn_context>'}
-        return system + selected[:-1] + [block, selected[-1]]
+        return system + selected + [block] if initiative else system + selected[:-1] + [block, selected[-1]]
 
     def size(messages):
         return len(_serialize(messages))
@@ -191,7 +196,7 @@ def build_reply_messages(conn, data, policy, speaker=None):
         'strategy': policy.strategy, 'final_model': policy.final_model,
         'message_roles': [m['role'] for m in messages],
         'input_chars': size(messages), 'omitted_blocks': omitted,
-        'data_blocks': list(context), 'version': 'q1-v1',
+        'data_blocks': list(context), 'version': 'q1-v1', 'initiative':initiative,
     })
 
 
@@ -224,7 +229,12 @@ def generate_role_reply(conn, request, policy, packet, sentence_id=None, _format
             close()
     if not reply_is_current(conn, packet, sentence_id):
         return None
-    text = _spoken(''.join(chunks))
+    raw=''.join(chunks)
+    if request.diagnostics.get('initiative'):
+        from core.utils.companion_initiative import SILENT
+        if not raw.strip() or raw.strip()==SILENT:return None
+        if SILENT in raw:raise ValueError('Mixed initiative control signal')
+    text = _spoken(raw)
     from core.utils.companion_expression import select_dialogue_policy, spoken_format_feedback
     feedback = spoken_format_feedback(text) if select_dialogue_policy(conn) else None
     if feedback:
@@ -262,7 +272,8 @@ def finalize_role_reply(conn, text, sentence_id, packet, policy):
     runtime_event = bool((packet or {}).get('runtime_event'))
     conn.tts.store_tts_text(sentence_id, text)
     conn.dialogue.put(Message('assistant', text, turn_id=sentence_id,
-                             delivery_status='generated', is_runtime_event=runtime_event))
+                             delivery_status='generated', is_runtime_event=runtime_event,
+                             origin=(packet or {}).get('input_origin')))
     conn._companion_last_finalized = sentence_id
     recent_ref = (packet or {}).get('recent_turn')
     if recent_ref and not runtime_event:

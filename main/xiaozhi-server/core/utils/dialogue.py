@@ -17,6 +17,7 @@ class Message:
             is_runtime_event=False,
             turn_id=None,
             delivery_status=None,
+            origin=None,
     ):
         self.uniq_id = uniq_id if uniq_id is not None else str(uuid.uuid4())
         self.role = role
@@ -29,6 +30,7 @@ class Message:
         self.is_runtime_event = is_runtime_event
         self.turn_id = turn_id
         self.delivery_status = delivery_status
+        self.origin = origin
 
 
 class Dialogue:

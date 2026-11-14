@@ -23,6 +23,8 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
     # 跳过旧句子残留音频
     if sentence_id is not None and sentence_id != conn.sentence_id:
         return
+    from core.utils.companion_initiative import output_allowed
+    if not await output_allowed(conn,sentence_id):return
 
     if conn.tts.tts_audio_first_sentence:
         conn.logger.bind(tag=TAG).info(f"发送第一段语音: {text}")
@@ -56,6 +58,15 @@ async def sendAudioMessage(conn: "ConnectionHandler", sentenceType, audios, text
         await send_tts_message(conn, "stop", None, turn_id=sentence_id)
         if conn.close_after_chat:
             await conn.close()
+    elif conn.calling and sentenceType == SentenceType.LAST and getattr(conn,'_initiative_runtime',None):
+        async def drained():
+            await _wait_for_audio_completion(conn)
+            if sentence_id==conn.sentence_id and not conn.client_abort:
+                from core.utils.companion_initiative import transport_finished
+                await transport_finished(conn,sentence_id)
+        tasks=getattr(conn,'_initiative_drain_tasks',None)
+        if tasks is None:tasks=conn._initiative_drain_tasks=set()
+        task=asyncio.create_task(drained());tasks.add(task);task.add_done_callback(tasks.discard)
 
 
 async def _wait_for_audio_completion(conn: "ConnectionHandler"):
@@ -269,6 +280,9 @@ async def _do_send_audio(conn: "ConnectionHandler", opus_packet, flow_control):
     """
     执行实际的音频发送
     """
+    from core.utils.companion_initiative import output_allowed
+    if not await output_allowed(conn,flow_control['sentence_id']):
+        raise asyncio.CancelledError('主动台词已取消')
     packet_index = flow_control.get("packet_count", 0)
     sequence = flow_control.get("sequence", 0)
 
@@ -329,6 +343,8 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None, turn_id=
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
     if state == 'stop' and not conn.client_abort:
+        from core.utils.companion_initiative import transport_finished
+        await transport_finished(conn,current_sentence_id)
         if getattr(conn, '_recent_audio_sentence', None) == current_sentence_id:
             from core.utils.companion_memory import mark_episode_delivery
             await asyncio.to_thread(mark_episode_delivery, conn, current_sentence_id, 'audio_sent')

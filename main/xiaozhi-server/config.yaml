@@ -126,6 +126,23 @@ companion_speech:
   slow_rate: 0.85
   fast_rate: 1.15
   ttl_seconds: 60
+# Q6 仅已连接通话，必须显式授权用户作用域；空列表不启用。
+companion_initiative:
+  enabled: false
+  companion_id: xiaoyuan
+  allowed_subject_scopes: []
+  allowed_device_ids: []
+  min_silence_seconds: 20
+  cooldown_seconds: 180
+  candidate_ttl_seconds: 60
+  max_source_age_seconds: 600
+  quiet_ttl_seconds: 3600
+  heartbeat_seconds: 2
+  presence_ttl_seconds: 8
+  playback_guard_seconds: 2
+  max_per_session: 2
+  topic_cooldown_seconds: 86400
+  max_output_chars: 160
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词

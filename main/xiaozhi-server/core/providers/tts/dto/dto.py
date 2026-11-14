@@ -1,5 +1,22 @@
 from enum import Enum
 from typing import Union, Optional
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class SpeechDelivery:
+    turn_id: str
+    generation: int
+    subject_scope: str
+    epoch: int
+    companion_id: str
+    policy: str
+    style: str
+    instruction: Optional[str]
+    rate: Optional[float]
+    text_sha256: str
+    issued_at: float
+    source: str
 
 
 class SentenceType(Enum):
@@ -35,9 +52,11 @@ class TTSMessageDTO:
         content_detail: Optional[str] = None,
         # 如果内容类型为文件，则需要传入文件路径
         content_file: Optional[str] = None,
+        delivery: Optional[SpeechDelivery] = None,
     ):
         self.sentence_id = sentence_id
         self.sentence_type = sentence_type
         self.content_type = content_type
         self.content_detail = content_detail
         self.content_file = content_file
+        self.delivery = delivery

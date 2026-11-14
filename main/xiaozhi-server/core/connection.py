@@ -811,6 +811,8 @@ class ConnectionHandler:
             await self._initialize_private_config_async()
             # 在线程池中初始化组件
             await self.loop.run_in_executor(self.executor, self._initialize_components)
+            from core.utils.companion_initiative import ensure_runtime
+            await ensure_runtime(self)
         except Exception as e:
             self.initialization_error = type(e).__name__
             self.logger.bind(tag=TAG).error(f"后台初始化失败: {self.initialization_error}")
@@ -1800,6 +1802,8 @@ class ConnectionHandler:
     async def close(self, ws=None):
         """资源清理方法"""
         try:
+            from core.utils.companion_initiative import close_runtime
+            await close_runtime(self)
             from core.utils.companion_affect import cancel_affect_turn
             await asyncio.to_thread(cancel_affect_turn, self)
             from core.utils.companion_memory import close_episode_turns
