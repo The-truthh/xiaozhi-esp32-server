@@ -88,6 +88,16 @@ delivery_requirements是必须满足的交付条件。若有format_correction，
 遵循schema输出JSON，不写长篇理由。"""
 TURN_RULES += RECENT_RULES
 REVIEW_RULES += RECENT_RULES
+INPUT_RULES = """
+runtime_capabilities.input是应用提供的真实输入来源：asr表示语音识别后的文字，不能说用户只能打字或应用听不到语音；
+user_text表示本轮是文字输入，automatic_wakeup不是用户主动说出的个人事实。
+语言模型没有原始声音、音色情绪或口音证据，不能从转写文字断言具体方言或识别准确率，也不能承诺未验证的方言合成能力。
+不要把没有原始声音证据说成整个产品“听不到声音、只能看文字”；asr输入可以自然说明这句话收到了，
+但现有信息不足以确定具体方言，不声称一定听清、全部听懂，也不需要向用户解释内部模型架构。
+有歧义时只确认影响回答的词；输入通顺时正常交流，不每轮解释转写流程。能力与执行结果分开，能查询不等于已经查到。
+"""
+TURN_RULES += INPUT_RULES
+REVIEW_RULES += INPUT_RULES
 
 
 def _spoken(text):
@@ -101,15 +111,46 @@ def _spoken(text):
     return text
 
 
+def explicit_news_limit(text):
+    """A narrow upper-bound guard for an explicit 'only N items' instruction.
+
+    General count/intent interpretation still belongs to the structured router.
+    Ordinals, quoted instructions and negated restrictions are not count limits.
+    """
+    text = str(text or '')
+    if re.search(r'[“”「」『』"‘’]|(?:不要|别|不用|不必|不是).{0,3}(?:只|就)', text):
+        return None
+    match = re.search(r'(?:只|就)(?:要|听|讲|说|播|读|给我|讲给我|说给我)?\s*([1-5一二两三四五])\s*条', text)
+    if not match:
+        return None
+    return dict(zip('12345一二三四五两', [1,2,3,4,5,1,2,3,4,5,2]))[match[1]]
+
+
+def delivery_tool_results(bundles, utterance):
+    """Select the requested news before constructing mandatory spoken checks."""
+    explicit = explicit_news_limit(utterance)
+    selected = []
+    for bundle in bundles:
+        if bundle.get('topic') == 'news' and bundle.get('operation') != 'detail':
+            limit = bundle.get('requested_result_limit')
+            if type(limit) is not int or not 1 <= limit <= 5:
+                limit = len(bundle.get('results', []))
+            if explicit is not None:
+                limit = min(limit, explicit)
+            bundle = dict(bundle, results=bundle.get('results', [])[:limit])
+        selected.append(bundle)
+    return selected
+
+
 def _compose_reply(conn, messages, data, draft):
+    data = dict(data, tool_results=delivery_tool_results(
+        data['tool_results'], data.get('current_user_utterance')))
     expected = [i for b in data['tool_results'] if b.get('topic')=='news' and b.get('status')=='ok'
                 and b.get('operation') != 'detail' for i in range(1,len(b.get('results',[]))+1)]
     payload = {'current_turn_data':data, 'draft':draft,
                'dialogue':[m for m in messages if m['role'] in ('user','assistant')][-9:]}
-    if data['tool_results']:
-        # The lookup has already resolved the city/date/reference. Unrelated
-        # old assistant small talk must not take over a failed lookup reply.
-        payload['dialogue'] = [{'role':'user','content':data.get('current_user_utterance') or ''}]
+    # Keep recent requests/corrections even during a lookup. Tool results remain
+    # the factual authority, but they do not replace conversational constraints.
     read = data.get('personal_memory_read') or {}
     quote_requested = bool(re.search(r'原话|原文|逐字',data.get('current_user_utterance') or ''))
     if re.search(r'(?:别|不要|不用|不必).{0,4}(?:原话|原文|逐字)',data.get('current_user_utterance') or ''):
@@ -134,6 +175,15 @@ def _compose_reply(conn, messages, data, draft):
                     or any(type(n) is not int for n in result['news_numbers'])):
                 raise ValueError('Invalid response composition')
             answer = _spoken(result['reply'])
+            origin = data.get('runtime_capabilities', {}).get('input', {}).get('origin')
+            source_denials = re.finditer(
+                    r'听不(?:到|见).{0,8}(?:声音|语音)|(?:只能|只(?:能)?看(?:到|见)).{0,6}(?:文字|文本|打字)'
+                    r'|(?:不能|无法|不支持).{0,6}(?:接收|听取|处理).{0,4}语音', answer)
+            if origin == 'asr' and any(
+                    not re.search(r'(?:不是|并非|并不是)$', answer[:m.start()])
+                    for m in source_denials):
+                raise ValueError('本轮确实是语音识别输入，不能说产品听不到声音或只能看文字。'
+                                 '不要解释内部模型架构；可说明这句话已收到，但证据不足以判断具体方言。')
             if not quote_requested and re.search(
                     r'(?:您|你).{0,6}(?:还没|没有|没|未|只|仅).{0,5}(?:告诉|提过|提到|说过|说起)'
                     r'|(?:咱们|我们).{0,5}(?:还没|没有|没|未).{0,4}(?:聊过|谈过|说过|提过)',answer):
@@ -169,7 +219,8 @@ def _compose_reply(conn, messages, data, draft):
     raise ValueError('No composed reply')
 
 
-def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None):
+def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
+                            runtime_capabilities=None):
     """One generated utterance for chat, reads and operations; no literal fallback.
 
     The independent existing intent LLM organizes a final reply with the same
@@ -258,13 +309,25 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None)
                 'write_receipt':'queued' if packet.get('memory_job') else 'none',
                 'history_coverage':'partial',
                 'local_time':datetime.now(TZ).isoformat()}
+        from core.utils.runtime_capabilities import build_runtime_capabilities
+        capabilities = dict(runtime_capabilities or build_runtime_capabilities(
+            conn.config, intent_type=getattr(conn, 'intent_type', None),
+            input_origin=packet.get('input_origin', 'unknown'),
+            read_only=bool(getattr(getattr(conn, 'intent', None), 'read_only', False))))
+        capabilities.update(
+            personal_memory_available=managed and token is not None,
+            core_memory_status=core.get('status'),
+            memory_returned_this_request=bool(core.get('facts') or related or (read or {}).get('evidence')),
+            memory_write_this_turn=data['write_receipt'])
+        if getattr(memory, 'memory_unavailable', False):
+            capabilities.update(memory_provider='unavailable', cross_session_recall='unavailable',
+                                memory_write_this_turn='unavailable')
+        data['runtime_capabilities'] = capabilities
         # Recompile fresh per attempt: do not carry stale assembled memory or a
         # fixed technical answer into a retry. Stored dialogue remains auditable.
         messages = conn.dialogue.get_llm_dialogue_with_memory(
             '', conn.config.get('voiceprint', {}), speaker, repair_rejected_naming=True,
-            runtime_capabilities={'personal_memory_available':managed,
-                'memory_returned_this_request':bool(core.get('facts') or related or (read or {}).get('evidence')),
-                'memory_write_this_turn':data['write_receipt']})
+            runtime_capabilities=capabilities)
         if query is not None and (not messages or messages[-1].get('role') != 'user'
                                    or messages[-1].get('content') != query):
             messages.append({'role':'user','content':query})

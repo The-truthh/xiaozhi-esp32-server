@@ -13,13 +13,22 @@ async def handleAbortMessage(conn: "ConnectionHandler"):
     # 设置成打断状态，会自动打断llm、tts任务
     conn.close_after_chat = False
     conn.client_abort = True
+    interrupted_turn = getattr(conn, "sentence_id", None)
+    dialogue = getattr(conn, "dialogue", None)
+    if dialogue is not None:
+        dialogue.mark_delivery(interrupted_turn, "interrupted")
     pending=getattr(conn,'_recent_reply_delivery',None)
+    if not pending:
+        sent = getattr(conn, '_recent_reply_sent', None)
+        if sent and sent[0] == interrupted_turn:
+            pending = sent
     if pending:
         try:
             await asyncio.to_thread(conn.memory.record_recent_reply,pending[1],status='interrupted')
         except Exception as exc:
             conn.logger.bind(tag=TAG).warning('近期打断状态保存不可用: '+type(exc).__name__)
         if getattr(conn,'_recent_reply_delivery',None)==pending:conn._recent_reply_delivery=None
+        if getattr(conn,'_recent_reply_sent',None)==pending:conn._recent_reply_sent=None
     if hasattr(conn, "information_session"):
         conn.information_session.invalidate()
     cancel_audio = None
@@ -29,7 +38,8 @@ async def handleAbortMessage(conn: "ConnectionHandler"):
     conn.clear_queues()
     # 打断客户端说话状态
     await conn.websocket.send(
-        json.dumps({"type": "tts", "state": "stop", "session_id": conn.session_id})
+        json.dumps({"type": "tts", "state": "stop", "session_id": conn.session_id,
+                    "reason": "interrupted", "turn_id": interrupted_turn})
     )
     conn.clearSpeakStatus()
     if cancel_audio:

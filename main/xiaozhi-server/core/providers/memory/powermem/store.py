@@ -151,10 +151,14 @@ class Store:
                                     "WHERE id=? AND scope=? AND epoch=? AND reply_status='unanswered'",
                                     (text,reference['id'],scope,reference['epoch']))
             else:
+                # Transport completion is not playback completion: an abort
+                # may arrive while the client's remaining buffers are playing.
+                previous = ('queued', 'audio_sent') if status == 'interrupted' else ('queued',)
                 cursor = db.execute("UPDATE recent_turns SET reply_status=?, "
                                     "assistant_text=CASE WHEN ?='interrupted' THEN '' ELSE assistant_text END "
-                                    "WHERE id=? AND scope=? AND epoch=? AND reply_status='queued'",
-                                    (status,status,reference['id'],scope,reference['epoch']))
+                                    "WHERE id=? AND scope=? AND epoch=? AND reply_status IN ("
+                                    + ','.join('?' for _ in previous) + ')',
+                                    (status,status,reference['id'],scope,reference['epoch'],*previous))
             return cursor.rowcount == 1
 
     def recent_snapshot(self, scope, session_id):

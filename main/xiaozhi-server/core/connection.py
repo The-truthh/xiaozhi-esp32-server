@@ -1197,7 +1197,9 @@ class ConnectionHandler:
             from core.utils.runtime_capabilities import build_runtime_capabilities
 
             runtime_capabilities = build_runtime_capabilities(
-                self.config, functions, memory_str, self.intent_type
+                self.config, functions, memory_str, self.intent_type,
+                input_origin=(lookup_context or {}).get("input_origin", "unknown"),
+                read_only=bool(getattr(getattr(self, "intent", None), "read_only", False)),
             )
             if core_memory is not None:
                 runtime_capabilities.update(core_memory_status=core_memory['status'],
@@ -1228,7 +1230,9 @@ class ConnectionHandler:
                 if depth == 0 and (self.intent_type == "nointent" or lookup_context) else None
             )
             if depth == 0 and natural_response_enabled(self):
-                llm_responses = natural_reply_responses(self, lookup_context, memory_str, speaker_for_system, query=query)
+                llm_responses = natural_reply_responses(
+                    self, lookup_context, memory_str, speaker_for_system, query=query,
+                    runtime_capabilities=runtime_capabilities)
             elif lookup_context and lookup_context.get('memory_query'):
                 def personal_fact_responses():
                     # Resolve lazily at delivery, not when the intent model
@@ -1584,6 +1588,10 @@ class ConnectionHandler:
             self.dialogue.put(Message(
                 role="assistant", content=text_buff,
                 is_runtime_event=bool((lookup_context or {}).get("runtime_event")),
+                turn_id=current_sentence_id,
+                delivery_status=("interrupted" if self.client_abort
+                                 or current_sentence_id != self.sentence_id
+                                 else "generated"),
             ))
             # Persist generated wording separately from playback completion.
             # Missing TTS completion remains queued; it is never a shared promise.

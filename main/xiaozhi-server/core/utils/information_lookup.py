@@ -108,6 +108,7 @@ class InformationLookup:
     async def one(self, request):
         result = {"status": "error", "topic": request["topic"], "query": request["query"],
                   "operation": request["operation"],
+                  "requested_result_limit": request["result_limit"],
                   "fetched_at": datetime.now(TZ).isoformat(), "results": [], "error_code": None}
         try:
             if request["operation"] in ("detail", "next"):

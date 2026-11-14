@@ -15,6 +15,8 @@ class Message:
             tool_call_id=None,
             is_temporary=False,
             is_runtime_event=False,
+            turn_id=None,
+            delivery_status=None,
     ):
         self.uniq_id = uniq_id if uniq_id is not None else str(uuid.uuid4())
         self.role = role
@@ -25,6 +27,8 @@ class Message:
         # Keep technical failures auditable, without teaching the next turn that
         # the user asked to search or the character said something substantive.
         self.is_runtime_event = is_runtime_event
+        self.turn_id = turn_id
+        self.delivery_status = delivery_status
 
 
 class Dialogue:
@@ -35,6 +39,16 @@ class Dialogue:
 
     def put(self, message: Message):
         self.dialogue.append(message)
+
+    def mark_delivery(self, turn_id, status):
+        """Keep audit text, but never present an interrupted utterance as heard."""
+        if not turn_id:
+            return
+        for message in self.dialogue:
+            if message.role == "assistant" and message.turn_id == turn_id:
+                # A late transport completion cannot undo an interruption.
+                if message.delivery_status != "interrupted":
+                    message.delivery_status = status
 
     def getMessages(self, m, dialogue):
         if m.tool_calls is not None:
@@ -108,7 +122,8 @@ class Dialogue:
         dialogue = []
         actual_messages = [m for m in self.dialogue
                            if m.role != "system" and not m.is_temporary
-                           and not m.is_runtime_event]
+                           and not m.is_runtime_event
+                           and m.delivery_status != "interrupted"]
         naming_correction_now = False
         if repair_rejected_naming:
             actual_messages, naming_correction_now = self._repair_rejected_naming(
@@ -295,7 +310,8 @@ class Dialogue:
             return "您好，我在呢。"
 
         actual = [m for m in self.dialogue if m.role != "system"
-                  and not m.is_temporary and not m.is_runtime_event]
+                  and not m.is_temporary and not m.is_runtime_event
+                  and m.delivery_status != "interrupted"]
         repaired, correction_now = self._repair_rejected_naming(actual)
         # A correction may also give a new nickname; leave that request to the
         # model, with its rejected preceding turn withdrawn by the assembler.

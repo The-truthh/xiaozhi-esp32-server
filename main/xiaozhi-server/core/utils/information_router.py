@@ -180,7 +180,8 @@ class ReadOnlySession:
         natural = natural_response_enabled(self.conn)
         history = [{"role": m.role, "content": speech(m.content or "")[:700]}
                    for m in self.conn.dialogue.dialogue if m.role in ("user", "assistant")
-                   and not m.is_temporary and not m.is_runtime_event][-8:]
+                   and not m.is_temporary and not m.is_runtime_event
+                   and getattr(m, 'delivery_status', None) != 'interrupted'][-8:]
         payload = {"current_time": datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(),
                    "history": history, "lookup_state": self.state,
                    "personal_memory_available": bool(getattr(getattr(self.conn, "memory", None), "managed", False)),
@@ -297,7 +298,8 @@ class ReadOnlySession:
 
     async def run(self, text, generation, memory_event=None):
         start = time.perf_counter()
-        packet = {"generation": generation}
+        packet = {"generation": generation,
+                  "input_origin": (memory_event or {}).get("origin", "unknown")}
         trace = {"generation": generation}
         try:
             from core.utils.information_response import natural_response_enabled
@@ -358,7 +360,11 @@ class ReadOnlySession:
                     if plan["clarification_slot"] == "location":
                         self.state["pending"] = {"topic": "weather", "user_request": speech(text)}
                 elif route == "lookup":
+                    from core.utils.information_response import explicit_news_limit
+                    news_limit = explicit_news_limit(speech(text))
                     for request in plan["requests"]:
+                        if request["topic"] == "news" and request["operation"] != "detail" and news_limit:
+                            request["result_limit"] = news_limit
                         if request["topic"] == "weather":
                             location = request["location"]
                             confirmed = self.state.get("queries", {}).get("weather", {}).get("location")
