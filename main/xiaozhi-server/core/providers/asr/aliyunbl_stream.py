@@ -10,6 +10,7 @@ if TYPE_CHECKING:
 from config.logger import setup_logging
 from core.providers.asr.base import ASRProviderBase
 from core.providers.asr.dto.dto import InterfaceType
+from core.utils.alibl_endpoint import build_ws_connect_options, resolve_ws_url
 
 TAG = __name__
 logger = setup_logging()
@@ -26,11 +27,13 @@ class ASRProvider(ASRProviderBase):
         self.is_processing = False
         self.server_ready = False  # 服务器准备状态
         self.task_id = None  # 当前任务ID
+        self.finish_sent = False
+        self._cleanup_lock = asyncio.Lock()
 
         # 阿里百炼配置
         self.api_key = config.get("api_key")
         self.model = config.get("model", "paraformer-realtime-v2")
-        self.sample_rate = config.get("sample_rate", 16000)
+        self.sample_rate = int(config.get("sample_rate") or 16000)
         self.format = config.get("format", "pcm")
 
         # 可选参数
@@ -39,13 +42,18 @@ class ASRProvider(ASRProviderBase):
         self.language_hints = config.get("language_hints")
         self.semantic_punctuation_enabled = config.get("semantic_punctuation_enabled", False)
         max_sentence_silence = config.get("max_sentence_silence")
-        self.max_sentence_silence = int(max_sentence_silence) if max_sentence_silence else 200
+        default_silence = 800 if self.model.endswith("-asr-flash-message") else 200
+        self.max_sentence_silence = int(max_sentence_silence) if max_sentence_silence else default_silence
         self.multi_threshold_mode_enabled = config.get("multi_threshold_mode_enabled", False)
         self.punctuation_prediction_enabled = config.get("punctuation_prediction_enabled", True)
         self.inverse_text_normalization_enabled = config.get("inverse_text_normalization_enabled", True)
 
         # WebSocket URL
-        self.ws_url = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+        self.ws_url = resolve_ws_url(config.get("ws_url"))
+        self.ws_connect_options = build_ws_connect_options(10)
+        self.is_message_model = self.model.startswith("qwen-audio-") and self.model.endswith("-asr-flash-message")
+        if self.is_message_model and self.sample_rate != 16000:
+            raise ValueError("Qwen-Audio-ASR-Message requires a 16000 Hz sample rate")
 
         self.output_dir = config.get("output_dir", "./audio_output")
         self.delete_audio_file = delete_audio_file
@@ -83,6 +91,7 @@ class ASRProvider(ASRProviderBase):
 
             self.is_processing = True
             self.task_id = uuid.uuid4().hex
+            self.finish_sent = False
 
             # 建立WebSocket连接
             headers = {
@@ -97,7 +106,10 @@ class ASRProvider(ASRProviderBase):
                 max_size=1000000000,
                 ping_interval=None,
                 ping_timeout=None,
-                close_timeout=5,
+                # Keep the protocol close deadline shorter than cleanup's
+                # outer timeout so normal close expiry is handled by websockets.
+                close_timeout=1,
+                **self.ws_connect_options,
             )
 
             logger.bind(tag=TAG).debug("WebSocket连接建立成功")
@@ -145,6 +157,30 @@ class ASRProvider(ASRProviderBase):
             }
         }
 
+        # Message uses the same event envelope but a different parameter set.
+        # Do not send Paraformer-only controls to this model.
+        if self.is_message_model:
+            parameters = {
+                "format": self.format,
+                "sample_rate": self.sample_rate,
+                "max_sentence_silence": self.max_sentence_silence,
+            }
+            for key, default in (
+                ("keep_dialect", True),
+                ("disfluency_removal_enabled", False),
+                ("intermediate_result_enabled", False),
+            ):
+                value = self.config.get(key, default)
+                if isinstance(value, str):
+                    value = value.strip().lower() == "true"
+                parameters[key] = bool(value)
+            parameters["vad_model"] = self.config.get("vad_model") or "far_field_meeting_16k"
+            if self.vocabulary_id:
+                parameters["vocabulary_id"] = self.vocabulary_id
+            if self.config.get("vocabulary"):
+                parameters["vocabulary"] = self.config["vocabulary"]
+            message["payload"]["parameters"] = parameters
+
         # 只有当模型名称以v2结尾时才添加vocabulary_id参数
         if self.model.lower().endswith("v2"):
             message["payload"]["parameters"]["vocabulary_id"] = self.vocabulary_id
@@ -189,6 +225,8 @@ class ASRProvider(ASRProviderBase):
                         sentence = output.get("sentence", {})
 
                         text = sentence.get("text", "")
+                        if sentence.get("heartbeat") or not text:
+                            continue
                         sentence_end = sentence.get("sentence_end", False)
                         end_time = sentence.get("end_time")
 
@@ -218,6 +256,7 @@ class ASRProvider(ASRProviderBase):
 
                     # 处理task-finished事件
                     elif event == "task-finished":
+                        self.finish_sent = True
                         logger.bind(tag=TAG).debug("任务已完成")
                         break
 
@@ -259,7 +298,10 @@ class ASRProvider(ASRProviderBase):
 
     async def _send_finish_task(self):
         """发送finish-task指令"""
-        if self.asr_ws and self.task_id:
+        if self.asr_ws and self.task_id and not self.finish_sent:
+            # A manual stop and result-loop cleanup can run concurrently.
+            # Mark before awaiting so the task receives only one finish command.
+            self.finish_sent = True
             try:
                 finish_msg = {
                     "header": {
@@ -278,6 +320,10 @@ class ASRProvider(ASRProviderBase):
 
     async def _cleanup(self):
         """清理资源"""
+        async with self._cleanup_lock:
+            await self._cleanup_session()
+
+    async def _cleanup_session(self):
         logger.bind(tag=TAG).debug(f"开始ASR会话清理 | 当前状态: processing={self.is_processing}, server_ready={self.server_ready}")
 
         # 状态重置
