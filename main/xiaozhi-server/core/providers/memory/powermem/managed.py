@@ -72,8 +72,8 @@ def identity_statement(text):
     extractor still decides whether the source actually asserts a self fact.
     """
     return bool(re.search(
-        r'(?:叫|喊|唤|称呼)(?:我|俺|咱)(?!什么|啥|谁|哪个|吗|呢|[？?])'
-        r'|(?:我|俺|咱)叫(?!什么|啥|谁|哪个|的|吗|呢|[？?])'
+        r'(?:叫|喊|唤|称呼)(?:我|俺|咱)(?!什么|啥|谁|哪个|吗|呢|一声|一下|一遍|起来|起床|帮忙|[，,。！!？?\s]|$)'
+        r'|(?:我|俺|咱)叫(?!什么|啥|谁|哪个|的|吗|呢|[，,。！!？?\s]|$)'
         r'|(?:我|俺|咱)(?:的)?(?:名字|姓名|全名|称呼)是(?!什么|啥|谁|哪个|[？?])'
         r'|(?:别|不要|不再).{0,8}(?:叫|喊|称呼)|改叫|改称', speech(text)))
 
@@ -82,6 +82,14 @@ def personal_statement(text):
     """Conservative fence for an explicit assertion inside a recall question."""
     text = speech(text)
     def asserted(value):
+        # A concrete literal inside a question is still not a new assertion.
+        # Preserve a separate correction before that question.
+        if re.search(r'(?:吗|么|呢)[？?。！!\s]*$|是不是|是否|什么|啥|哪(?:种|个|部)'
+                     r'|原话|原文|逐字|(?:我|俺|咱).{0,4}(?:说过|提过|告诉过)', value):
+            clauses = re.split(r'[，,。；;]', value)
+            if len(clauses) > 1:
+                return any(asserted(c) for c in clauses if c and c != value)
+            return False
         return identity_statement(value) or bool(re.search(
             r'(?:我|俺|咱).{0,10}(?:不喜欢|喜欢|爱听|爱吃|讨厌)'
             r'(?![听吃看喝玩]?(?:什么|啥|哪|谁|[？?]))\S'
@@ -92,6 +100,16 @@ def personal_statement(text):
     if recall and not asserted(text[:recall.start()]):
         return False
     return asserted(text)
+
+
+def identity_fields(text):
+    """Scope a syntactic pending fence; the extractor still verifies the fact."""
+    text = speech(text)
+    if not identity_statement(text) or not personal_statement(text):return set()
+    fields = set()
+    if re.search(r'(?:我|俺|咱)叫|(?:名字|姓名|全名)是', text):fields.add('name')
+    if re.search(r'(?:叫|喊|唤|称呼)(?:我|俺|咱)|改叫|改称', text):fields.add('preferred_address')
+    return fields or set(CORE_KEYS)
 
 
 def eligible(event):
@@ -449,7 +467,7 @@ class ManagedMemory:
         for field in sorted(CORE_KEYS):
             row = by_field.get(field)
             pending = [r for r in snapshot['pending']
-                       if r['observed_at'] >= (row['observed_at'] if row else '') and identity_statement(r['text'])]
+                       if r['observed_at'] >= (row['observed_at'] if row else '') and field in identity_fields(r['text'])]
             if pending:
                 fields[field] = 'unconfirmed' if any(r['state'] == 'failed' for r in pending) else 'processing'
             else:
@@ -468,6 +486,20 @@ class ManagedMemory:
         signature = lambda value: (value['status'], value['epoch'], value.get('fields'),
                                    sorted((r['id'], r['revision']) for r in value['facts']))
         return signature(current) == signature(snapshot)
+
+    def delivery_token(self, references=()):
+        """Version only the facts used by a reply, never outbox progress.
+
+        Epoch fences deletion. Core facts remain in the token even if a pending
+        correction temporarily hides them from the generation context.
+        """
+        if self.scope is None:
+            raise PermissionError('No bound memory scope')
+        snapshot = self.engine.store.personal_snapshot(self.scope)
+        identifiers = {r['id'] for r in references}
+        rows = [r for r in snapshot['facts'] if r['id'] in identifiers
+                or (r['subject'] == '本人' and r['fact_key'] in CORE_KEYS)]
+        return (snapshot['epoch'], tuple(sorted((r['id'], r['revision']) for r in rows)))
 
     def query_catalog(self):
         """Bounded, scoped evidence for selection by the existing intent model.
@@ -546,7 +578,7 @@ class ManagedMemory:
     def read_facts(self, selection, read_status='ok'):
         return self.answer_facts(selection, read_status, include_evidence=True)
 
-    def answer_identity(self, field):
+    def answer_identity(self, field, *, include_evidence=False):
         """Answer a narrow personal-fact read without unconstrained generation.
 
         Preserve original evidence instead of guessing a normalized name from
@@ -566,7 +598,7 @@ class ManagedMemory:
         # saved value. Never announce the old value as current while it runs.
         pending = [row for row in snapshot['pending']
                    if row['observed_at'] >= (selected['observed_at'] if selected else '')
-                   and identity_statement(row['text'])]
+                   and key in identity_fields(row['text'])]
         used = []
         if pending:
             failed = any(row['state'] == 'failed' for row in pending)
@@ -588,10 +620,17 @@ class ManagedMemory:
             else:
                 response = ('我这里还没有已确认的姓名信息。' if field == 'name'
                             else '我这里还没有已确认的姓名或称呼，您希望我怎么称呼您？')
-        return {'response': response, 'status': status, 'field': field,
+        result = {'response': response, 'status': status, 'field': field,
                 'scope_hash': hashlib.sha256(self.scope.encode()).hexdigest()[:12],
                 'facts': [{'id': row['id'], 'revision': row['revision']} for row in used],
                 'elapsed_ms': round((time.perf_counter() - started) * 1000)}
+        if include_evidence:
+            result['evidence'] = [{k: r[k] for k in ('id', 'revision', 'fact_key', 'subject', 'evidence', 'observed_at')}
+                                  for r in used]
+        return result
+
+    def read_identity(self, field):
+        return self.answer_identity(field, include_evidence=True)
 
     def forget(self,keys=None):
         count=self.engine.store.forget(self.scope,keys)
@@ -602,7 +641,8 @@ class ManagedMemory:
         text=speech(text)
         if re.fullmatch(r'(?:请|麻烦你)?(?:清空|删除|忘记)(?:你保存的|关于我|我的|我)?(?:所有|全部)?(?:长期)?记忆[。！!？?\s]*',text):
             self.forget()
-            return {'response':'好，以后聊天我不再使用这些记忆。这次没有删除聊天记录。',
+            return {'operation': {'kind':'forget_all','status':'completed','chat_history_deleted':False},
+                    'response':'好，以后聊天我不再使用这些记忆。这次没有删除聊天记录。',
                     'redact_history':True}
         target=re.fullmatch(r'(?:请)?(?:忘记|删除)(?:我|我的)(称呼|名字|姓名|住址|城市|喜好|偏好|兴趣)(?:的记忆|信息)?[。！!？?\s]*',text)
         if target:
@@ -612,10 +652,14 @@ class ManagedMemory:
             prefixes=groups[target[1]]
             keys=[row['fact_key'] for row in self.facts() if row['fact_key'].split(':')[0] in prefixes]
             self.forget(keys)
-            return {'response':'这项信息已从后续对话的记忆中移除。','redact_history':True}
+            return {'operation': {'kind':'forget_fields','status':'completed','fields':prefixes},
+                    'response':'这项信息已从后续对话的记忆中移除。','redact_history':True}
         if re.fullmatch(r'(?:查看我的记忆|你记得我什么|你记住了我什么|你还记得我的哪些事)[。！!？?\s]*',text):
             facts=self.facts()
-            return {'response':('我记着您说过：'+'；'.join('“'+row['content']+'”' for row in facts[:6])+'。')
+            return {'operation': {'kind':'list_memory','status':'found' if facts else 'absent',
+                                  'facts':[{k:r[k] for k in ('id','revision','fact_key','subject','evidence','observed_at')}
+                                           for r in facts[:6]]},
+                    'response':('我记着您说过：'+'；'.join('“'+row['content']+'”' for row in facts[:6])+'。')
                     if facts else '我这里暂时没有已保存的个人记忆。'}
         if re.match(r'^(?:请你?|麻烦你)?(?:记住|记一下|帮我记住)(?:[，,:：\s]|我|俺|咱)',text):
             job=await self.ingest_turn(event)
@@ -625,9 +669,13 @@ class ManagedMemory:
                     state=self.engine.store.status(job)['state']
                     if state=='done':
                         facts=[row for row in self.facts() if row['source_id']==job]
-                        return {'response':('记下了，您说的是：'+'；'.join('“'+row['content']+'”' for row in facts[:3])+'。')
+                        return {'operation': {'kind':'save_memory','status':'completed' if facts else 'no_fact',
+                                              'facts':[{k:r[k] for k in ('id','revision','fact_key','subject','evidence','observed_at')}
+                                                       for r in facts[:3]]},
+                                'response':('记下了，您说的是：'+'；'.join('“'+row['content']+'”' for row in facts[:3])+'。')
                                 if facts else '这句话里没有形成明确的个人事实，我还没有新增记忆。'}
                     if state in ('failed','cancelled'):break
                     await asyncio.sleep(.05)
-            return {'response':'这条信息还没有确认保存成功，您稍后可以让我查看记忆。'}
+            return {'operation': {'kind':'save_memory','status':'unconfirmed'},
+                    'response':'这条信息还没有确认保存成功，您稍后可以让我查看记忆。'}
         return None

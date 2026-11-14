@@ -206,6 +206,21 @@ class MemoryProvider(MemoryProviderBase):
             raise PermissionError('Personal memory is unavailable for this device')
         return self._managed.read_facts(selection, read_status)
 
+    def read_identity(self, field):
+        if self._memory_scope_denied or not getattr(self, 'managed', False) or not self._managed:
+            raise PermissionError('Personal memory is unavailable for this device')
+        return self._managed.read_identity(field)
+
+    def delivery_token(self, references=()):
+        if self._memory_scope_denied or not getattr(self, 'managed', False) or not self._managed:
+            raise PermissionError('Personal memory is unavailable for this device')
+        return self._managed.delivery_token(references)
+
+    def facts(self):
+        if self._memory_scope_denied or not getattr(self, 'managed', False) or not self._managed:
+            raise PermissionError('Personal memory is unavailable for this device')
+        return self._managed.facts()
+
     def query_catalog(self):
         if self._memory_scope_denied or not getattr(self, 'managed', False) or not self._managed:
             raise PermissionError('Personal memory is unavailable for this device')

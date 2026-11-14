@@ -1141,6 +1141,7 @@ class ConnectionHandler:
 
         try:
             # 使用带记忆的对话
+            from core.utils.information_response import natural_response_enabled, natural_reply_responses
             memory_str = None
             layered_memory = bool(getattr(self.memory, 'layered_context', False))
             core_memory = None
@@ -1152,6 +1153,12 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).warning(f'核心记忆读取不可用: {type(exc).__name__}')
             # 仅当query非空（代表用户询问）时查询记忆
             skip_memory = (lookup_context or {}).get('route') in ('grounded','memory','memory_query','lookup','clarify','cancel','unsupported')
+            if natural_response_enabled(self) and not (lookup_context or {}).get('related_context_needed',False):
+                # Broad semantic matches pulled music preferences into a new
+                # painting topic. Core identity stays independent; explicit
+                # personal questions use canonical reads, and continuity cues
+                # can still trigger optional historical retrieval.
+                skip_memory = True
             if self.memory is not None and query and not skip_memory:
                 future = asyncio.run_coroutine_threadsafe(
                     self.memory.query_memory(query), self.loop
@@ -1220,7 +1227,9 @@ class ConnectionHandler:
                 self.dialogue.get_naming_grounded_response()
                 if depth == 0 and (self.intent_type == "nointent" or lookup_context) else None
             )
-            if lookup_context and lookup_context.get('memory_query'):
+            if depth == 0 and natural_response_enabled(self):
+                llm_responses = natural_reply_responses(self, lookup_context, memory_str, speaker_for_system, query=query)
+            elif lookup_context and lookup_context.get('memory_query'):
                 def personal_fact_responses():
                     # Resolve lazily at delivery, not when the intent model
                     # started: a correction/delete may have completed meanwhile.

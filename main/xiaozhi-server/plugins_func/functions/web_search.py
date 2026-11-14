@@ -203,7 +203,11 @@ async def search_evidence(conn, query):
     Reuses existing search provider settings; DashScope is available with the
     explicitly configured independent intent model when no search key is bound.
     """
-    settings = conn.config.get("plugins", {}).get("web_search", {})
+    settings = (conn.config.get("plugins") or {}).get("web_search") or {}
+    if isinstance(settings,str):
+        try:settings=json.loads(settings)
+        except ValueError:settings={}
+    if not isinstance(settings,dict):settings={}
     provider = settings.get("provider", "dashscope").lower()
     async with httpx.AsyncClient(timeout=httpx.Timeout(12, connect=3), trust_env=False) as client:
         if provider == "dashscope":

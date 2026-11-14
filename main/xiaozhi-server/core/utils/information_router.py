@@ -5,6 +5,7 @@ No role prompt edits, action tools, or text-only fake executions. Personal fact
 queries use the separately scoped memory provider, never public search.
 """
 import asyncio
+import copy
 from datetime import datetime
 import json
 import re
@@ -42,6 +43,8 @@ ROUTER_PROMPT = """你只负责理解语音会话并输出内部路由，不扮�
 例如“我之前跟你说我喜欢什么音乐来着”“我不吃什么”“我上次去哪了”都是个人记忆查询，不是公开搜索或随意闲聊。
 facts只负责标记本人事实查询，程序随后读取证据；没有记忆也仍走memory_query，不按助手旧回答猜个人经历。
 只有问用户本人的过去信息才走facts；问“你喜欢什么音乐”是在问角色自身，必须走chat。
+“那你喊我一声”“按刚才的称呼叫一下”是使用已知称呼的交流动作，走chat，不是新增称呼。
+“确认好了吗”结合最近真实交流理解；不能把助手先前的未确认提示当成用户提供了新事实。
 “我喜欢Funky Style”“呃我喜欢那种U Jack Swing的”是个人偏好陈述，走chat，不因出现陌生词自动联网；明确要求查风格知识时才查询公开资料。
 memory_query路由：用户真的在问自己的姓名/称呼或测试你是否记得自己，如“我是谁”“我叫什么”“还记得我吗”。字段选identity。
 明确问希望怎样称呼/之前让你怎么叫自己，字段选preferred_address；明确问全名/真实姓名，字段选name。
@@ -173,6 +176,8 @@ class ReadOnlySession:
         return generation == getattr(self.conn, "lookup_generation", None) and not self.conn.client_abort
 
     async def plan(self, text):
+        from core.utils.information_response import natural_response_enabled
+        natural = natural_response_enabled(self.conn)
         history = [{"role": m.role, "content": speech(m.content or "")[:700]}
                    for m in self.conn.dialogue.dialogue if m.role in ("user", "assistant")
                    and not m.is_temporary and not m.is_runtime_event][-8:]
@@ -181,10 +186,33 @@ class ReadOnlySession:
                    "personal_memory_available": bool(getattr(getattr(self.conn, "memory", None), "managed", False)),
                    "user": speech(text)}
         llm = self.conn.intent.llm
+        schema = ROUTE_SCHEMA
+        prompt = ROUTER_PROMPT
+        if natural:
+            schema = copy.deepcopy(ROUTE_SCHEMA)
+            schema['properties'].update(user_fact_statement={'type':'boolean'}, related_context_needed={'type':'boolean'})
+            schema['required'] += ['user_fact_statement','related_context_needed']
+            prompt += ('\n另外独立判断两个布尔字段，不生成回答：'
+                'user_fact_statement仅当本轮用户明确提供或更正了真实个人事实才为true，'
+                '包括新称呼、喜好、生活事件；纯提问、让你使用已知称呼喊一声、确认好了没有都为false。'
+                '混合更正与提问时为true，但不能把问题里的假设当事实。'
+                'related_context_needed仅当普通闲聊确实要接续过去用户话题时为true，'
+                '例如接着聊以前喜欢的音乐；全新话题或一般知识讨论不需要个人历史，设false。'
+                '个人事实直接查询仍走memory_query，不靠这个字段代替。')
+            prompt += ('刚刚回答过本人喜好后，用户说“把音乐偏好按原话念一下”等追问，'
+                       '仍走memory_query且字段facts，重新读用户原始证据，不能把助手概括当作原话。')
         raw = await asyncio.wait_for(asyncio.to_thread(
-            llm.response_structured, ROUTER_PROMPT, json.dumps(payload, ensure_ascii=False), ROUTE_SCHEMA,
+            llm.response_structured, prompt, json.dumps(payload, ensure_ascii=False), schema,
             timeout=6), timeout=7)
-        plan = guard_personal_query(validate_plan(json.loads(raw)), text)
+        proposed = json.loads(raw)
+        meta = {}
+        if natural:
+            for key in ('user_fact_statement','related_context_needed'):
+                value = proposed.pop(key)
+                if type(value) is not bool:raise ValueError('Invalid semantic turn metadata')
+                meta['_'+key] = value
+        plan = guard_personal_query(validate_plan(proposed), text)
+        plan.update(meta)
         if plan['route'] == 'lookup' and plan['memory_query'] is None and explicit_preference_recall(text):
             plan['memory_query'] = 'facts'
             plan['_memory_recall_recovered'] = True
@@ -248,13 +276,16 @@ class ReadOnlySession:
         packet = {"generation": generation}
         trace = {"generation": generation}
         try:
+            from core.utils.information_response import natural_response_enabled
+            natural = natural_response_enabled(self.conn)
             memory = getattr(self.conn, 'memory', None)
             managed = getattr(memory, 'managed', False)
             control = await memory.control(text, memory_event or {}) if managed else None
             direct = self.grounded(text)
             if control is not None:
                 plan = {"route": "memory", "requests": []}
-                packet['direct_response'] = control['response']
+                if natural:packet['operation'] = control.get('operation', {'kind':'memory','status':'unconfirmed'})
+                else:packet['direct_response'] = control['response']
                 if control.get('redact_history'):
                     # Raw application logs remain auditable; old conversation
                     # context must not resurrect information explicitly forgotten.
@@ -262,11 +293,13 @@ class ReadOnlySession:
                         if message.role != 'system':message.is_runtime_event = True
             elif direct is not None:
                 plan = {"route": "grounded", "requests": []}
-                packet["direct_response"] = direct
+                if natural:packet['conversation_event'] = {'kind':'greeting_or_source_inquiry'}
+                else:packet["direct_response"] = direct
             else:
                 plan = await self.plan(text)
                 trace["router_ms"] = round((time.perf_counter() - start) * 1000)
                 route = plan["route"]
+                if natural:packet['related_context_needed'] = plan.get('_related_context_needed',False)
                 if plan.get("memory_query"):
                     # Read the canonical facts in chat immediately before TTS,
                     # not an answer invented or cached by the intent model.
@@ -279,11 +312,15 @@ class ReadOnlySession:
                         if plan.get('_memory_recall_recovered'):
                             trace['memory_recall_recovered'] = True
                 if route == "cancel":
-                    packet["direct_response"] = "好，不查了。"
+                    if natural:packet['operation'] = {'kind':'cancel_lookup','status':'completed'}
+                    else:packet["direct_response"] = "好，不查了。"
                 elif route == "unsupported":
-                    packet["direct_response"] = "我这里目前能查新闻、天气和公开资料，这件事还办不了。"
+                    if natural:packet['operation'] = {'kind':'requested_action','status':'unsupported',
+                        'available_read_topics':['news','weather','general']}
+                    else:packet["direct_response"] = "我这里目前能查新闻、天气和公开资料，这件事还办不了。"
                 elif route == "clarify":
-                    packet["direct_response"] = {
+                    if natural:packet['clarification_slot'] = plan['clarification_slot']
+                    else:packet["direct_response"] = {
                         "location": "您想查哪个城市的天气？", "date": "您想查哪一天的？",
                         "query": "您想查哪件事？"}[plan["clarification_slot"]]
                     if plan["clarification_slot"] == "location":
@@ -303,7 +340,7 @@ class ReadOnlySession:
                     service.commit(plan["requests"], bundles)
                     packet["evidence"] = bundles
                     trace["tool_statuses"] = [b["status"] for b in bundles]
-                    if not any(b["status"] == "ok" for b in bundles):
+                    if not natural and not any(b["status"] == "ok" for b in bundles):
                         packet["direct_response"] = service.failure_message(bundles)
             if not self.current(generation):
                 return
@@ -312,12 +349,19 @@ class ReadOnlySession:
                     # Pure recall questions carry no new identity fact. A mixed
                     # correction is ingested so it can fence a stale answer.
                     from core.providers.memory.powermem.managed import personal_statement
-                    if not packet.get('memory_query') or personal_statement(speech(text)):
+                    uses_address = bool(re.search(r'(?:叫|喊|唤)(?:我|俺|咱)(?:一声|一下|一遍)', speech(text)))
+                    assertion = personal_statement(speech(text))
+                    should_write = (plan.get('_user_fact_statement',False) or assertion) if natural else (not packet.get('memory_query') or assertion)
+                    if should_write and not (natural and uses_address and not assertion):
                         packet['memory_job'] = await memory.ingest_turn(memory_event)
                 except Exception as exc:
                     trace['memory_ingest_error'] = type(exc).__name__
             trace.update(route=plan["route"], topics=[r["topic"] for r in plan["requests"]],
                          total_ms=round((time.perf_counter() - start) * 1000))
+            if natural:
+                trace.update(user_fact_statement=plan.get('_user_fact_statement',False),
+                             related_context_needed=packet.get('related_context_needed',False),
+                             memory_write_queued=bool(packet.get('memory_job')))
             packet["route"] = plan["route"]
             self.last_trace = trace
             self.conn.logger.bind(tag="information_router").info("只读信息路由: " + json.dumps(trace, ensure_ascii=False))
@@ -332,6 +376,9 @@ class ReadOnlySession:
                     "只读信息路由异常: " + json.dumps(self.last_trace, ensure_ascii=False))
                 # No guessed task, fallback real-time answer, or conversational
                 # history contamination on a technical routing failure.
-                packet.update(route="error", runtime_event=True,
-                              direct_response="刚才处理出了点问题，您再说一遍好吗？")
+                from core.utils.information_response import natural_response_enabled
+                packet.update(route="error", runtime_event=True)
+                if natural_response_enabled(self.conn):
+                    packet['operation'] = {'kind':'route','status':'unavailable'}
+                else:packet['direct_response'] = "刚才处理出了点问题，您再说一遍好吗？"
                 self.conn.executor.submit(self.conn.chat, text, 0, packet)

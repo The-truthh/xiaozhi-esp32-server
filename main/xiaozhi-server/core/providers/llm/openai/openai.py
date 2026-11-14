@@ -113,7 +113,8 @@ class LLMProvider(LLMProviderBase):
         # 禁用思考模式
         self._apply_thinking_disabled(request_params)
 
-        responses = self.client.chat.completions.create(**request_params)
+        client = self.client.with_options(timeout=kwargs['timeout'], max_retries=0) if kwargs.get('timeout') else self.client
+        responses = client.chat.completions.create(**request_params)
 
         is_active = True
         try:            

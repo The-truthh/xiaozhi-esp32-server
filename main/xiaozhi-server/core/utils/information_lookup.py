@@ -1,5 +1,6 @@
 """Bounded information reads, using existing RSS, weather and search adapters."""
 import asyncio
+import json
 from datetime import datetime, timedelta, date
 from email.utils import parsedate_to_datetime
 import hashlib
@@ -38,6 +39,16 @@ def dated(value):
     return parsed.astimezone(TZ)
 
 
+def article_text(soup, hostname=''):
+    """Keep the verified publisher's article body out of recommendation lists."""
+    for node in soup(["script", "style", "nav", "footer", "header"]):
+        node.decompose()
+    body = soup.select_one('div.left_zw') if hostname.endswith('chinanews.com.cn') else None
+    body = body or soup.find("article") or soup.find("main") or soup.body or soup
+    paragraphs = [p.get_text(" ", strip=True) for p in body.find_all("p")]
+    return "\n".join(p for p in paragraphs if len(p) >= 15)[:5500]
+
+
 async def public_page(url, with_metadata=False):
     """Read only returned public URLs, without redirects to internal resources."""
     parsed = urlsplit(url)
@@ -68,11 +79,7 @@ async def public_page(url, with_metadata=False):
     deferred = soup.select_one("textarea.article-content")
     if deferred:
         soup = BeautifulSoup(deferred.get_text(), "html.parser")
-    for node in soup(["script", "style", "nav", "footer", "header"]):
-        node.decompose()
-    body = soup.find("article") or soup.find("main") or soup.body or soup
-    paragraphs = [p.get_text(" ", strip=True) for p in body.find_all("p")]
-    text = "\n".join(p for p in paragraphs if len(p) >= 15)[:5500]
+    text = article_text(soup, parsed.hostname)
     return {"content": text, "published_at": published} if with_metadata else text
 
 
@@ -176,7 +183,11 @@ class InformationLookup:
         today = datetime.now(TZ).date()
         if not today <= day <= today + timedelta(days=6):
             raise ValueError("date_unsupported")
-        settings = self.conn.config.get("plugins", {}).get("get_weather", {})
+        settings = (self.conn.config.get("plugins") or {}).get("get_weather") or {}
+        if isinstance(settings,str):
+            try:settings=json.loads(settings)
+            except ValueError:settings={}
+        if not isinstance(settings,dict):settings={}
         city = None
         if settings.get("api_key") and settings.get("api_host"):
             try:
@@ -211,7 +222,6 @@ class InformationLookup:
                 "current_details": basics if day == today else {}, "forecast": rows,
                 "observed_at": None, "temperature_unit": "摄氏度",
                 "data_note": "抓取时间不是观测时间；预报是预测，缺失字段未知"}
-        import json
         return [{"title": city_name + "天气（" + day.isoformat() + "）", "url": city["fxLink"],
                  "publisher": "和风天气", "published_at": None,
                  "content": json.dumps(data, ensure_ascii=False), "weather": data}]
@@ -222,14 +232,13 @@ class InformationLookup:
         Open-Meteo free endpoint is for non-commercial evaluation. A commercial
         deployment must configure an appropriately licensed endpoint/provider.
         """
-        import json
         name = location.removesuffix("市")
         async with httpx.AsyncClient(timeout=httpx.Timeout(7, connect=3), trust_env=False) as client:
             response = await client.get("https://geocoding-api.open-meteo.com/v1/search",
                 params={"name": name, "count": 10, "language": "zh", "format": "json"})
             response.raise_for_status()
             candidates = response.json().get("results", [])
-            matches = [c for c in candidates if name in (c.get("name"), c.get("admin2", "").removesuffix("市"))]
+            matches = [c for c in candidates if name in (c.get("name"), (c.get("admin2") or "").removesuffix("市"))]
             administrative = [c for c in matches if c.get("feature_code") in ("PPLC", "PPLA", "PPLA2")]
             matches = administrative or matches
             if len(matches) != 1:
