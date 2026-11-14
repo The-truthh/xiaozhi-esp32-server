@@ -199,7 +199,9 @@ class ReadOnlySession:
             schema = copy.deepcopy(ROUTE_SCHEMA)
             schema['properties'].update(user_fact_statement={'type':'boolean'}, related_context_needed={'type':'boolean'})
             schema['required'] += ['user_fact_statement','related_context_needed']
-            if getattr(getattr(self.conn,'memory',None),'recent_context_enabled',False):
+            from core.utils.companion_memory import select_episodes
+            if (getattr(getattr(self.conn,'memory',None),'recent_context_enabled',False)
+                    or select_episodes(self.conn) is not None):
                 schema['properties']['assistant_history_needed']={'type':'boolean'}
                 schema['properties']['recent_context_needed']={'type':'boolean'}
                 schema['required'].append('assistant_history_needed')

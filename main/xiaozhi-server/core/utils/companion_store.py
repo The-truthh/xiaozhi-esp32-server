@@ -10,8 +10,10 @@ import time
 
 
 class CompanionStore:
-    def __init__(self, ledger):
+    def __init__(self, ledger, initialize_affect=True):
         self.ledger = ledger
+        if not initialize_affect:
+            return
         with ledger.db() as db:
             db.executescript('''
                 CREATE TABLE IF NOT EXISTS companion_affect_events(
@@ -151,3 +153,238 @@ class CompanionStore:
                        "WHERE id=? AND status IN ('reserved','queued','processing')", (identifier,))
             if withdraw:
                 db.execute('DELETE FROM companion_affect WHERE source_event=?', (identifier,))
+
+
+class EpisodeStore(CompanionStore):
+    """Durable sourced episodes and an explicitly separate extraction outbox."""
+
+    def __init__(self, ledger):
+        super().__init__(ledger, initialize_affect=False)
+        with self.db() as db:
+            db.executescript('''
+                CREATE TABLE IF NOT EXISTS companion_episode_sources(
+                    id TEXT PRIMARY KEY, scope TEXT NOT NULL, companion_id TEXT NOT NULL,
+                    epoch INTEGER NOT NULL, session_id TEXT NOT NULL, source_turn TEXT NOT NULL,
+                    observed_at REAL NOT NULL, user_text TEXT NOT NULL, assistant_text TEXT NOT NULL DEFAULT '',
+                    delivery_status TEXT NOT NULL DEFAULT 'unanswered', semantic_revision INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE IF NOT EXISTS companion_episode_jobs(
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL, source_id TEXT NOT NULL,
+                    scope TEXT NOT NULL, companion_id TEXT NOT NULL, epoch INTEGER NOT NULL, policy TEXT NOT NULL,
+                    status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, due REAL NOT NULL DEFAULT 0,
+                    deadline REAL NOT NULL, error_class TEXT);
+                CREATE INDEX IF NOT EXISTS episode_ready ON companion_episode_jobs(scope,companion_id,status,due,seq);
+                CREATE TABLE IF NOT EXISTS companion_episodes(
+                    id TEXT PRIMARY KEY, scope TEXT NOT NULL, companion_id TEXT NOT NULL, epoch INTEGER NOT NULL,
+                    source_id TEXT NOT NULL UNIQUE, source_seq INTEGER NOT NULL, observed_at REAL NOT NULL,
+                    expires_at REAL NOT NULL, status TEXT NOT NULL, revision INTEGER NOT NULL, payload TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS episode_scope ON companion_episodes(scope,companion_id,epoch,status,observed_at);
+                CREATE TABLE IF NOT EXISTS companion_episode_audit(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, companion_id TEXT NOT NULL,
+                    episode_id TEXT NOT NULL, action TEXT NOT NULL, revision INTEGER NOT NULL,
+                    observed_at REAL NOT NULL, note TEXT NOT NULL DEFAULT '');
+            ''')
+
+    def reserve_episode(self, scope, companion, policy, session, turn, user_text, ttl=60, capacity=32):
+        stamp = time.time()
+        identifier = hashlib.sha256(json.dumps([scope, companion, session, turn]).encode()).hexdigest()
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            epoch = self.ledger._epoch(db, scope)
+            identifier = hashlib.sha256((identifier + ':' + str(epoch)).encode()).hexdigest()
+            self._expire(db, scope, companion, stamp)
+            old = db.execute('SELECT * FROM companion_episode_jobs WHERE id=?', (identifier,)).fetchone()
+            if old:
+                return dict(old) if old['epoch'] == epoch and old['status'] == 'reserved' else None
+            count = db.execute("SELECT COUNT(*) FROM companion_episode_jobs WHERE scope=? AND companion_id=? "
+                               "AND status IN ('reserved','queued','processing')", (scope, companion)).fetchone()[0]
+            if count >= capacity:
+                return None
+            db.execute('INSERT INTO companion_episode_sources(id,scope,companion_id,epoch,session_id,source_turn,observed_at,user_text) '
+                       'VALUES(?,?,?,?,?,?,?,?)', (identifier, scope, companion, epoch, session, turn, stamp, user_text))
+            db.execute("INSERT INTO companion_episode_jobs(id,source_id,scope,companion_id,epoch,policy,status,deadline) "
+                       "VALUES(?,?,?,?,?,?,'reserved',?)", (identifier, identifier, scope, companion, epoch, policy, stamp + ttl))
+            return dict(db.execute('SELECT * FROM companion_episode_jobs WHERE id=?', (identifier,)).fetchone())
+
+    @staticmethod
+    def _expire(db, scope, companion, stamp):
+        db.execute("UPDATE companion_episode_jobs SET status='expired' WHERE scope=? AND companion_id=? "
+                   "AND deadline<? AND status IN ('reserved','queued','processing')", (scope, companion, stamp))
+        db.execute('DELETE FROM companion_episodes WHERE scope=? AND companion_id=? AND expires_at<=?', (scope, companion, stamp))
+        db.execute("DELETE FROM companion_episode_sources WHERE scope=? AND companion_id=? "
+                   "AND id NOT IN (SELECT source_id FROM companion_episodes) AND id NOT IN "
+                   "(SELECT source_id FROM companion_episode_jobs WHERE status IN ('reserved','queued','processing'))",
+                   (scope, companion))
+        db.execute('DELETE FROM companion_episode_audit WHERE scope=? AND companion_id=? AND episode_id NOT IN '
+                   '(SELECT id FROM companion_episodes)', (scope, companion))
+        db.execute("DELETE FROM companion_episode_jobs WHERE scope=? AND companion_id=? AND status NOT IN ('reserved','queued','processing') "
+                   "AND seq NOT IN (SELECT seq FROM companion_episode_jobs WHERE scope=? AND companion_id=? ORDER BY seq DESC LIMIT 512)",
+                   (scope, companion, scope, companion))
+
+    def finish_episode(self, ticket, assistant='', status='generated'):
+        if status not in ('generated', 'failed', 'interrupted', 'unanswered'):
+            raise ValueError('Invalid episode source status')
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if self.ledger._epoch(db, ticket['scope']) != ticket['epoch']:
+                return False
+            row = db.execute('SELECT * FROM companion_episode_sources WHERE id=?', (ticket['source_id'],)).fetchone()
+            if not row:
+                return False
+            if row['delivery_status'] == 'unanswered':
+                db.execute('UPDATE companion_episode_sources SET assistant_text=?,delivery_status=?,semantic_revision=semantic_revision+1 WHERE id=?',
+                           (assistant, status, ticket['source_id']))
+            cursor = db.execute("UPDATE companion_episode_jobs SET status='queued' WHERE id=? AND status='reserved' AND deadline>=?",
+                                (ticket['id'], time.time()))
+            return cursor.rowcount == 1
+
+    def episode_delivery(self, ticket, status):
+        if status not in ('audio_sent', 'interrupted'):
+            raise ValueError('Invalid episode delivery status')
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if self.ledger._epoch(db, ticket['scope']) != ticket['epoch']:
+                return False
+            if status == 'interrupted':
+                db.execute("UPDATE companion_episode_sources SET delivery_status='interrupted',semantic_revision=semantic_revision+1 "
+                           "WHERE id=? AND delivery_status<>'interrupted'", (ticket['source_id'],))
+                db.execute("UPDATE companion_episode_jobs SET status='queued' WHERE id=? AND status='reserved'", (ticket['id'],))
+            else:
+                db.execute("UPDATE companion_episode_sources SET delivery_status='audio_sent' WHERE id=? AND delivery_status='generated'",
+                           (ticket['source_id'],))
+            return True
+
+    def claim_episode(self, scope, companion, policy):
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            self._expire(db, scope, companion, time.time())
+            epoch = self.ledger._epoch(db, scope)
+            if db.execute("SELECT 1 FROM companion_episode_jobs WHERE scope=? AND companion_id=? AND status='processing'", (scope, companion)).fetchone():
+                return None
+            row = db.execute("SELECT * FROM companion_episode_jobs WHERE scope=? AND companion_id=? AND epoch=? AND policy=? "
+                             "AND status='queued' AND due<=? ORDER BY seq LIMIT 1", (scope, companion, epoch, policy, time.time())).fetchone()
+            if not row:
+                return None
+            db.execute("UPDATE companion_episode_jobs SET status='processing',attempts=attempts+1 WHERE id=?", (row['id'],))
+            return dict(row, attempts=row['attempts'] + 1)
+
+    def episode_source(self, ticket):
+        with self.db() as db:
+            row = db.execute('SELECT s.* FROM companion_episode_sources s JOIN scopes p ON p.scope=s.scope AND p.epoch=s.epoch '
+                             'WHERE s.id=? AND s.epoch=?', (ticket['source_id'], ticket['epoch'])).fetchone()
+            return dict(row) if row else None
+
+    def newer_episode_sources(self, job):
+        with self.db() as db:
+            return [dict(r) for r in db.execute('SELECT s.user_text FROM companion_episode_sources s '
+                'JOIN companion_episode_jobs j ON j.source_id=s.id WHERE j.scope=? AND j.companion_id=? '
+                'AND j.epoch=? AND j.seq>? ORDER BY j.seq DESC LIMIT 16',
+                (job['scope'],job['companion_id'],job['epoch'],job['seq']))]
+
+    def stale_episode(self, job):
+        with self.db() as db:
+            db.execute("UPDATE companion_episode_jobs SET status='stale' WHERE id=? AND epoch=? AND status='processing'",
+                       (job['id'],job['epoch']))
+
+    def cancel_episode(self, ticket):
+        with self.db() as db:
+            db.execute("UPDATE companion_episode_jobs SET status='cancelled' WHERE id=? AND epoch=? "
+                       "AND status IN ('reserved','queued','processing')",(ticket['id'],ticket['epoch']))
+
+    def episode_records(self, scope, companion, limit=256, include_withdrawn=False):
+        with self.db() as db:
+            db.execute('BEGIN')
+            row = db.execute('SELECT epoch FROM scopes WHERE scope=?', (scope,)).fetchone()
+            epoch = row[0] if row else 0
+            rows = db.execute('SELECT e.*,s.user_text,s.assistant_text,s.delivery_status,s.semantic_revision,s.session_id,s.source_turn '
+                              'FROM companion_episodes e LEFT JOIN companion_episode_sources s ON s.id=e.source_id '
+                              'WHERE e.scope=? AND e.companion_id=? AND e.epoch=? AND e.expires_at>? '
+                              + ('' if include_withdrawn else "AND e.status IN ('active','resolved') ")
+                              + 'ORDER BY e.source_seq DESC LIMIT ?', (scope, companion, epoch, time.time(), max(1, min(512, limit)))).fetchall()
+            result=[]
+            for row in rows:
+                value=dict(row);value['payload']=json.loads(value['payload']);result.append(value)
+            return epoch, result
+
+    def episodes_current(self, scope, companion, token):
+        with self.db() as db:
+            row = db.execute('SELECT epoch FROM scopes WHERE scope=?', (scope,)).fetchone()
+            if (row[0] if row else 0) != token[0]:
+                return False
+            for identifier, revision, source_revision in token[1]:
+                found = db.execute("SELECT e.revision,s.semantic_revision FROM companion_episodes e JOIN companion_episode_sources s ON s.id=e.source_id "
+                                   "WHERE e.id=? AND e.scope=? AND e.companion_id=? AND e.status IN ('active','resolved') AND e.expires_at>?",
+                                   (identifier, scope, companion, time.time())).fetchone()
+                if not found or tuple(found) != (revision, source_revision):
+                    return False
+            return True
+
+    def apply_episode(self, job, result, references, retention_days):
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = db.execute('SELECT status,deadline FROM companion_episode_jobs WHERE id=?', (job['id'],)).fetchone()
+            source = db.execute('SELECT * FROM companion_episode_sources WHERE id=?', (job['source_id'],)).fetchone()
+            valid = (current and current['status']=='processing' and current['deadline']>=time.time() and source
+                     and self.ledger._epoch(db,job['scope'])==job['epoch'])
+            targets={}
+            for ref in references:
+                row=db.execute('SELECT * FROM companion_episodes WHERE id=? AND scope=? AND companion_id=?',
+                               (ref['id'],job['scope'],job['companion_id'])).fetchone()
+                if not row or row['revision']!=ref['revision'] or row['status'] not in ('active','resolved'):
+                    valid=False
+                else:
+                    original=db.execute('SELECT semantic_revision FROM companion_episode_sources WHERE id=?',(row['source_id'],)).fetchone()
+                    if not original or original[0]!=ref['source_revision']:valid=False
+                    targets[row['id']]=row
+            if not valid:
+                if current:db.execute("UPDATE companion_episode_jobs SET status='stale' WHERE id=?",(job['id'],))
+                return False
+            if not result['keep']:
+                db.execute("UPDATE companion_episode_jobs SET status='skipped' WHERE id=?",(job['id'],))
+                db.execute('DELETE FROM companion_episode_sources WHERE id=?',(job['source_id'],))
+                return True
+            for key,status in (('supersedes','superseded'),('resolves','resolved')):
+                for identifier in result[key]:
+                    target=targets.get(identifier)
+                    if not target or target['source_seq']>=job['seq']:
+                        raise ValueError('Invalid episode target sequence')
+                    db.execute('UPDATE companion_episodes SET status=?,revision=revision+1 WHERE id=?',(status,identifier))
+                    db.execute('INSERT INTO companion_episode_audit(scope,companion_id,episode_id,action,revision,observed_at) VALUES(?,?,?,?,?,?)',
+                               (job['scope'],job['companion_id'],identifier,status,target['revision']+1,time.time()))
+            identifier=hashlib.sha256((job['source_id']+':episode').encode()).hexdigest()
+            payload=dict(result)
+            if source['delivery_status'] in ('interrupted','failed','unanswered'):
+                payload.update(role_reaction='',interpretation='')
+            db.execute('INSERT OR IGNORE INTO companion_episodes VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                       (identifier,job['scope'],job['companion_id'],job['epoch'],job['source_id'],job['seq'],source['observed_at'],
+                        source['observed_at']+retention_days*86400,'active',1,json.dumps(payload,ensure_ascii=False)))
+            db.execute("UPDATE companion_episode_jobs SET status='done' WHERE id=?",(job['id'],))
+            return True
+
+    def fail_episode(self, job, error_class):
+        with self.db() as db:
+            db.execute("UPDATE companion_episode_jobs SET status=?,error_class=?,due=? WHERE id=? AND status='processing'",
+                       ('queued' if job['attempts']<2 else 'failed',error_class,time.time()+1,job['id']))
+
+    def maintain_episode(self, scope, companion, identifier, revision, changes=None, delete=False, note=''):
+        allowed={'topic','summary','role_reaction','interpretation','unfinished'}
+        if changes is not None and (not isinstance(changes,dict) or set(changes)-allowed):
+            raise ValueError('Cannot alter episode provenance')
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT e.* FROM companion_episodes e JOIN scopes s ON s.scope=e.scope AND s.epoch=e.epoch '
+                           'WHERE e.id=? AND e.scope=? AND e.companion_id=?',(identifier,scope,companion)).fetchone()
+            if not row or row['revision']!=revision or row['status']=='deleted':
+                return False
+            payload=json.loads(row['payload']);payload.update(changes or {})
+            if any(not isinstance(v,str) or len(v)>500 for k,v in (changes or {}).items() if k!='unfinished'):
+                raise ValueError('Invalid episode edit')
+            if 'unfinished' in (changes or {}) and type(changes['unfinished']) is not bool:
+                raise ValueError('Invalid unfinished status')
+            if delete:
+                payload={};db.execute('DELETE FROM companion_episode_sources WHERE id=?',(row['source_id'],))
+                db.execute('DELETE FROM companion_episode_audit WHERE episode_id=?',(identifier,))
+            db.execute('UPDATE companion_episodes SET payload=?,status=?,revision=revision+1 WHERE id=?',
+                       (json.dumps(payload,ensure_ascii=False),'deleted' if delete else row['status'],identifier))
+            db.execute('INSERT INTO companion_episode_audit(scope,companion_id,episode_id,action,revision,observed_at,note) VALUES(?,?,?,?,?,?,?)',
+                       (scope,companion,identifier,'delete' if delete else 'edit',revision+1,time.time(),str(note)[:160] if not delete else ''))
+            return True

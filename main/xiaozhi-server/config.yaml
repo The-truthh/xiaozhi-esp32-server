@@ -3,7 +3,7 @@
 # 系统会优先读取【data/.config.yaml】文件的配置，如果【.config.yaml】文件里的配置不存在，系统会自动去读取【config.yaml】文件的配置。
 # 这样做，可以最简化配置，保护您的密钥安全。
 # 如果你使用了智控台，那么以下所有配置，都不会生效，请在智控台中修改配置
-# 例外：本地 dialogue_quality / companion_affect 是服务端灰度开关，智控台模式也保留。
+# 例外：本地 dialogue_quality / companion_affect / companion_memory 是灰度开关，智控台模式也保留。
 
 # #####################################################################################
 # #############################以下是服务器基本运行配置####################################
@@ -94,6 +94,18 @@ companion_affect:
   mood_half_life_hours: 6
   max_age_hours: 24
   min_intensity: 0.2
+# Q3 有来源的相处经历，独立于Q2情绪；默认不整理、不建表、不召回。
+companion_memory:
+  enabled: false
+  companion_id: xiaoyuan
+  allowed_device_ids: []
+  allowed_subject_scopes: []
+  timeout: 6
+  task_ttl: 60
+  queue_capacity: 32
+  retention_days: 90
+  max_records: 3
+  context_max_chars: 4000
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词

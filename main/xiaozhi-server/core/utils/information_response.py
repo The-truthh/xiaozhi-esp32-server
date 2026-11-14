@@ -241,6 +241,8 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
     direct = reply_policy is not None and reply_policy.strategy == 'role_direct'
     from core.utils.companion_affect import prepare_affect_turn, affect_context
     affect_turn = prepare_affect_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
+    from core.utils.companion_memory import prepare_episode_turn, episode_context, episode_context_current
+    episode_turn = prepare_episode_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
     def current():
         if direct:
             from core.utils.companion_response import reply_is_current
@@ -341,6 +343,10 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
         role_affect = affect_context(conn, affect_turn)
         if role_affect:
             data['companion_affect'] = role_affect
+        episodes, episode_token = episode_context(conn, episode_turn, packet, query)
+        if episodes:
+            data['companion_episodes'] = episodes
+            capabilities['memory_returned_this_request'] = True
         # Recompile fresh per attempt: do not carry stale assembled memory or a
         # fixed technical answer into a retry. Stored dialogue remains auditable.
         try:
@@ -380,6 +386,9 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
             if not current():return
             if managed and token is not None and token != memory.delivery_token(references):
                 conn.logger.bind(tag='natural_response').info('事实版本变化，重新读取并生成')
+                continue
+            if not episode_context_current(conn, episode_turn, episode_token):
+                conn.logger.bind(tag='companion_memory').info('经历来源变化，重新读取并生成')
                 continue
             conn.logger.bind(tag='natural_response').info('角色回答交付: '+json.dumps({
                 'route':packet.get('route'),'read_status':(read or {}).get('status'),
