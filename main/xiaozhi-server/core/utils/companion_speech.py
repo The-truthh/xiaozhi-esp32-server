@@ -23,8 +23,12 @@ class SpeechPolicy:
     slow_rate:float=.85
     fast_rate:float=1.15
     ttl_seconds:float=60
+    planning:str='rules'
     @property
-    def fingerprint(self):return hashlib.sha256(json.dumps(dict(version='q5-v1',**asdict(self)),sort_keys=True).encode()).hexdigest()
+    def fingerprint(self):
+        values=asdict(self);planning=values.pop('planning')
+        if planning!='rules':values['planning']=planning
+        return hashlib.sha256(json.dumps(dict(version='q5-v1',**values),sort_keys=True).encode()).hexdigest()
 
 
 def select_speech_policy(conn):
@@ -40,8 +44,9 @@ def select_speech_policy(conn):
         devices,scopes=cfg.get('allowed_device_ids',[]),cfg.get('allowed_subject_scopes',[])
         if any(not isinstance(v,list) or any(not isinstance(s,str) or not s for s in v) for v in (devices,scopes)):return None
         if conn.device_id not in devices and managed.scope not in scopes:return None
-        companion=cfg.get('companion_id','xiaoyuan');mode=cfg.get('mode','natural')
+        companion=cfg.get('companion_id','xiaoyuan');mode=cfg.get('mode','natural');planning=cfg.get('planning','rules')
         if not isinstance(companion,str) or not re.fullmatch(r'[\w.-]{1,80}',companion) or mode not in ('natural','plain'):return None
+        if planning not in ('rules','model'):return None
         caps=conn.tts.speech_capabilities()
         if not caps.get('instruction') or caps.get('provider')!='alibl_stream':return None
         values={}
@@ -49,7 +54,7 @@ def select_speech_policy(conn):
             value=cfg.get(key,default)
             if type(value) not in (float,int) or not math.isfinite(value) or not low<=value<=high:return None
             values[key]=value
-        return managed,SpeechPolicy(companion,mode,**values)
+        return managed,SpeechPolicy(companion,mode,planning=planning,**values)
     except (AttributeError,TypeError,ValueError):return None
 
 
@@ -85,22 +90,58 @@ def _direction(conn,text,policy,turn):
     return 'warm','neutral_context'
 
 
+def model_planning_enabled(conn):
+    selected=select_speech_policy(conn)
+    return bool(selected and selected[1].mode=='natural' and selected[1].planning=='model')
+
+
+def _issue_delivery(conn,text,query,turn_id,selected,style,instruction,source,plan=None):
+    managed,p=selected
+    from core.utils.information_router import speech
+    delivery=SpeechDelivery(turn_id,getattr(conn,'lookup_generation',0),managed.scope,managed.delivery_token()[0],p.companion_id,p.fingerprint,
+        style,instruction,_rate_request(speech(query),p),hashlib.sha256(text.encode()).hexdigest(),time.monotonic(),source,plan)
+    cache=getattr(conn,'_speech_deliveries',None)
+    if cache is None:cache=conn._speech_deliveries=OrderedDict()
+    cache[turn_id]=delivery
+    while len(cache)>16:cache.popitem(last=False)
+    return delivery
+
+
+def bind_model_delivery(conn,packet,text,query,value,turn_id,expected_epoch):
+    """Bind only a final, evidence-validated result. No retries/model calls here."""
+    if not isinstance(packet,dict):return None
+    packet.pop('_speech_plan',None)
+    try:
+        if not model_planning_enabled(conn) or packet.get('runtime_event'):return None
+        from core.utils.companion_response import reply_is_current
+        from core.utils.speech_plan import validate_speech_plan,compile_speech_plan
+        selected=select_speech_policy(conn)
+        if (not reply_is_current(conn,packet,turn_id) or expected_epoch is None
+                or selected[0].delivery_token()[0]!=expected_epoch):return None
+        if value is None:packet['speech_plan_status']='fallback_missing';return None
+        plan=validate_speech_plan(value,text)
+        delivery=_issue_delivery(conn,text,query,turn_id,selected,'model',compile_speech_plan(plan),'final_author',plan)
+        if delivery.epoch!=expected_epoch:return None
+        packet['_speech_plan']=delivery;packet['speech_plan_status']='model'
+        return delivery
+    except Exception:
+        packet['speech_plan_status']='fallback_invalid'
+        return None
+
+
 def make_delivery(conn,text,query,packet,turn_id):
     selected=select_speech_policy(conn)
     if not selected or (packet or {}).get('runtime_event'):return None
     from core.utils.companion_response import reply_is_current
     if not reply_is_current(conn,packet,turn_id):return None
     managed,p=selected
-    epoch=managed.delivery_token()[0]
+    candidate=(packet or {}).get('_speech_plan')
+    if (p.planning=='model' and isinstance(candidate,SpeechDelivery)
+            and candidate.style=='model' and candidate.text_sha256==hashlib.sha256(text.encode()).hexdigest()
+            and compile_delivery(conn,conn.tts,candidate,turn_id)):
+        return candidate
     style,source=_direction(conn,text,p,turn_id)
-    from core.utils.information_router import speech
-    delivery=SpeechDelivery(turn_id,getattr(conn,'lookup_generation',0),managed.scope,epoch,p.companion_id,p.fingerprint,
-        style,DIRECTIONS[style],_rate_request(speech(query),p),hashlib.sha256(text.encode()).hexdigest(),time.monotonic(),source)
-    cache=getattr(conn,'_speech_deliveries',None)
-    if cache is None:cache=conn._speech_deliveries=OrderedDict()
-    cache[turn_id]=delivery
-    while len(cache)>16:cache.popitem(last=False)
-    return delivery
+    return _issue_delivery(conn,text,query,turn_id,selected,style,DIRECTIONS[style],source)
 
 
 def compile_delivery(conn,provider,delivery,turn_id):
@@ -117,7 +158,13 @@ def compile_delivery(conn,provider,delivery,turn_id):
     if delivery.epoch!=managed.delivery_token()[0]:return {}
     caps=provider.speech_capabilities()
     if not caps.get('instruction') or caps.get('model') not in QWEN_INSTRUCTION_MODELS:return {}
-    if delivery.style not in DIRECTIONS or delivery.instruction!=DIRECTIONS[delivery.style]:return {}
+    if delivery.style=='model':
+        if p.planning!='model' or p.mode!='natural':return {}
+        try:
+            from core.utils.speech_plan import compile_speech_plan
+            if delivery.instruction!=compile_speech_plan(delivery.plan):return {}
+        except (ValueError,TypeError,KeyError,AttributeError):return {}
+    elif delivery.style not in DIRECTIONS or delivery.instruction!=DIRECTIONS[delivery.style]:return {}
     params={}
     if delivery.instruction:params['instruction']=delivery.instruction
     if delivery.rate is not None:

@@ -181,12 +181,21 @@ def _compose_reply(conn, messages, data, draft):
     if initiative:
         from core.utils.companion_initiative import AUTHOR_RULES
         author_rules=AUTHOR_RULES
+    from core.utils.companion_speech import model_planning_enabled
+    schema=REVIEW_SCHEMA;plan_rules=''
+    if model_planning_enabled(conn):
+        from copy import deepcopy
+        from core.utils.speech_plan import PLAN_SCHEMA,PLAN_RULES
+        schema=deepcopy(REVIEW_SCHEMA);schema['properties']['speech_plan']=deepcopy(PLAN_SCHEMA)
+        schema['required'].append('speech_plan');plan_rules=PLAN_RULES
     for attempt in range(2):
-        raw = conn.intent.llm.response_structured(messages[0]['content']+'\n'+REVIEW_RULES+author_rules,
-            json.dumps(payload,ensure_ascii=False), REVIEW_SCHEMA, timeout=8)
+        raw = conn.intent.llm.response_structured(messages[0]['content']+'\n'+REVIEW_RULES+author_rules+plan_rules,
+            json.dumps(payload,ensure_ascii=False), schema, timeout=8)
         try:
             result = json.loads(raw)
-            if (not isinstance(result,dict) or set(result)!=set(REVIEW_SCHEMA['required'])
+            base_fields=set(REVIEW_SCHEMA['required'])
+            if (not isinstance(result,dict) or not base_fields.issubset(result)
+                    or set(result)-base_fields-({'speech_plan'} if plan_rules else set())
                     or type(result['valid']) is not bool
                     or any(not isinstance(result[k],str) for k in ('reply','reason'))
                     or result['reason'] not in REVIEW_SCHEMA['properties']['reason']['enum']
@@ -257,6 +266,7 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
     concurrent change once. Outbox progress alone cannot invalidate delivery.
     """
     packet = packet or {}
+    packet.pop('_speech_plan',None)
     direct = reply_policy is not None and reply_policy.strategy == 'role_direct'
     from core.utils.companion_affect import prepare_affect_turn, affect_context
     affect_turn = prepare_affect_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
@@ -437,6 +447,12 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
                 # Only a fresh, validated retry may replace the initial speech
                 # epoch after a concurrent forget; unvalidated old text cannot.
                 packet['_speech_epoch'] = token[0] if token is not None else None
+                if not direct:
+                    # A stale attempt must never issue a vocal plan for new facts.
+                    # Invalid/missing direction falls back without regenerating text.
+                    from core.utils.companion_speech import bind_model_delivery
+                    bind_model_delivery(conn,packet,answer,query,review.get('speech_plan'),
+                                        sentence_id or getattr(conn,'sentence_id',None),packet['_speech_epoch'])
             yield answer
             return
         except Exception as exc:

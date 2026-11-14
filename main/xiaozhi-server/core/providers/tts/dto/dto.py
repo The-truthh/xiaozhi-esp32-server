@@ -4,6 +4,15 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
+class SpeechPlan:
+    attitude: str
+    intensity: str
+    phrasing: str
+    emphasis: tuple
+    pauses: str
+
+
+@dataclass(frozen=True)
 class SpeechDelivery:
     turn_id: str
     generation: int
@@ -17,6 +26,7 @@ class SpeechDelivery:
     text_sha256: str
     issued_at: float
     source: str
+    plan: Optional[SpeechPlan] = None
 
 
 class SentenceType(Enum):
