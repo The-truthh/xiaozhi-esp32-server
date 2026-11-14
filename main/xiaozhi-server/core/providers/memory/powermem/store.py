@@ -75,6 +75,12 @@ class Store:
                     error_class TEXT, updated_at TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS job_ready ON jobs(state,due);
                 CREATE INDEX IF NOT EXISTS active_fact ON facts(scope,active);
+                CREATE TABLE IF NOT EXISTS recent_turns(
+                    id TEXT PRIMARY KEY, scope TEXT NOT NULL, epoch INTEGER NOT NULL,
+                    session_id TEXT NOT NULL, observed_at TEXT NOT NULL,
+                    user_text TEXT NOT NULL, assistant_text TEXT NOT NULL DEFAULT '',
+                    reply_status TEXT NOT NULL DEFAULT 'unanswered');
+                CREATE INDEX IF NOT EXISTS recent_scope ON recent_turns(scope,observed_at);
             """)
         Path(self.path).chmod(0o600)
 
@@ -114,6 +120,70 @@ class Store:
                        (identifier, scope, epoch, event['text'], event['observed_at'], event['origin']))
             self._job(db, identifier, scope, epoch, 'extract', {'source_id': identifier})
         return identifier
+
+    def recent_append(self, scope, session_id, event_id, text):
+        """Checkpoint real user input before inference; never run extraction here."""
+        stamp = now()
+        identifier = hashlib.sha256((scope + ':recent:' + event_id).encode()).hexdigest()
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            epoch = self._epoch(db, scope)
+            # An old callback cannot recreate a deleted turn through an upsert.
+            db.execute('INSERT OR IGNORE INTO recent_turns '
+                       '(id,scope,epoch,session_id,observed_at,user_text) VALUES(?,?,?,?,?,?)',
+                       (identifier, scope, epoch, session_id, stamp, text))
+            cutoff = (datetime.fromisoformat(stamp)-timedelta(hours=72)).isoformat()
+            db.execute('DELETE FROM recent_turns WHERE scope=? AND '
+                       '(observed_at<? OR epoch<>?)', (scope, cutoff, epoch))
+            db.execute('DELETE FROM recent_turns WHERE scope=? AND id NOT IN '
+                       '(SELECT id FROM recent_turns WHERE scope=? ORDER BY observed_at DESC,rowid DESC LIMIT 256)',
+                       (scope, scope))
+        return {'id':identifier, 'epoch':epoch}
+
+    def recent_reply(self, scope, reference, text=None, status='queued'):
+        if status not in ('queued', 'audio_sent', 'interrupted'):
+            raise ValueError('Invalid recent reply status')
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if self._epoch(db, scope) != reference['epoch']:return False
+            if text is not None:
+                cursor = db.execute("UPDATE recent_turns SET assistant_text=?,reply_status='queued' "
+                                    "WHERE id=? AND scope=? AND epoch=? AND reply_status='unanswered'",
+                                    (text,reference['id'],scope,reference['epoch']))
+            else:
+                cursor = db.execute("UPDATE recent_turns SET reply_status=?, "
+                                    "assistant_text=CASE WHEN ?='interrupted' THEN '' ELSE assistant_text END "
+                                    "WHERE id=? AND scope=? AND epoch=? AND reply_status='queued'",
+                                    (status,status,reference['id'],scope,reference['epoch']))
+            return cursor.rowcount == 1
+
+    def recent_snapshot(self, scope, session_id):
+        stamp = now()
+        cutoff = (datetime.fromisoformat(stamp)-timedelta(hours=72)).isoformat()
+        with self.db() as db:
+            db.execute('BEGIN')
+            row = db.execute('SELECT epoch FROM scopes WHERE scope=?', (scope,)).fetchone()
+            epoch = row['epoch'] if row else 0
+            rows = db.execute('SELECT * FROM recent_turns WHERE scope=? AND epoch=? '
+                              'AND session_id<>? AND observed_at>=? '
+                              'ORDER BY observed_at DESC,rowid DESC LIMIT 256',
+                              (scope,epoch,session_id,cutoff)).fetchall()
+        turns=[]; sessions=[]; size=0
+        for row in rows:
+            session=row['session_id']
+            if session not in sessions:
+                if len(sessions)==3:continue
+                sessions.append(session)
+            text_size=len(row['user_text'])+len(row['assistant_text'])
+            if len(turns)==12 or size+text_size>6000:break
+            turns.append(dict(call=sessions.index(session)+1, observed_at=row['observed_at'],
+                              local_observed_at=datetime.fromisoformat(row['observed_at']).astimezone(
+                                  timezone(timedelta(hours=8))).isoformat(),
+                              user=row['user_text'], assistant=row['assistant_text'],
+                              reply_status=row['reply_status']))
+            size+=text_size
+        return dict(status='ok', epoch=epoch, coverage='partial', retention_hours=72,
+                    calls_order='1 is the most recently active prior call', turns=list(reversed(turns)))
 
     def claim(self):
         with self.db() as db:
@@ -234,6 +304,9 @@ class Store:
             db.execute("BEGIN IMMEDIATE")
             epoch = self._epoch(db, scope) + 1
             db.execute("UPDATE scopes SET epoch=? WHERE scope=?", (epoch, scope))
+            # Conservative whole-window withdrawal also applies to field deletion:
+            # free-form dialogue may mention the deleted fact through pronouns.
+            db.execute('DELETE FROM recent_turns WHERE scope=?', (scope,))
             # Every old extraction job is fenced; even old sources can no longer
             # be re-extracted after a deletion. This is deliberately conservative.
             db.execute("UPDATE jobs SET state='cancelled',payload='{}' WHERE scope=? "

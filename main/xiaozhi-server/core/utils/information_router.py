@@ -185,13 +185,32 @@ class ReadOnlySession:
                    "history": history, "lookup_state": self.state,
                    "personal_memory_available": bool(getattr(getattr(self.conn, "memory", None), "managed", False)),
                    "user": speech(text)}
+        from core.utils.information_response import recent_conversations, RECENT_RULES
+        payload['recent_conversations']=await asyncio.to_thread(recent_conversations,self.conn)
         llm = self.conn.intent.llm
         schema = ROUTE_SCHEMA
         prompt = ROUTER_PROMPT
+        if payload['recent_conversations'].get('turns'):
+            prompt += RECENT_RULES + ('\n可结合此前通话理解“刚才/上次/接着聊”等指代。'
+                '近期对话本身可支持事件续聊，不要求事实账本一定已有同一条。'
+                '旧工具列表仅是历史台词，无法恢复可操作的新闻编号；缺少本通result_sets时重新查询或澄清。')
         if natural:
             schema = copy.deepcopy(ROUTE_SCHEMA)
             schema['properties'].update(user_fact_statement={'type':'boolean'}, related_context_needed={'type':'boolean'})
             schema['required'] += ['user_fact_statement','related_context_needed']
+            if getattr(getattr(self.conn,'memory',None),'recent_context_enabled',False):
+                schema['properties']['assistant_history_needed']={'type':'boolean'}
+                schema['properties']['recent_context_needed']={'type':'boolean'}
+                schema['required'].append('assistant_history_needed')
+                schema['required'].append('recent_context_needed')
+                prompt += ('\nrecent_context_needed只在用户要接续/回忆此前通话、存在省略指代，'
+                    '或本轮确实与历史用户原话同一话题时为true。新知识问题、新话题和纯问候为false，'
+                    '不要仅因之前聊过音乐，就把现在谈水墨画视为同一话题；默认false。')
+                prompt += ('\nassistant_history_needed只在用户要复述/接续小圆上次说的话、故事、建议、问题时为true，'
+                    '例如“上次你建议我怎么做”“你刚才问我什么”“继续你刚才讲的故事”；'
+                    '默认false，问用户的姓名、家人、喜好、经历或计划时为false。'
+                    '提供的recent_conversations默认仅有历史user原话，assistant_available表示另有助手台词可读。'
+                    '要回忆小圆建议或故事走chat，不把它当用户个人事实查询。')
             prompt += ('\n另外独立判断两个布尔字段，不生成回答：'
                 'user_fact_statement仅当本轮用户明确提供或更正了真实个人事实才为true，'
                 '包括新称呼、喜好、生活事件；纯提问、让你使用已知称呼喊一声、确认好了没有都为false。'
@@ -211,6 +230,11 @@ class ReadOnlySession:
                 value = proposed.pop(key)
                 if type(value) is not bool:raise ValueError('Invalid semantic turn metadata')
                 meta['_'+key] = value
+            if 'assistant_history_needed' in schema.get('required',[]):
+                for key in ('assistant_history_needed','recent_context_needed'):
+                    value=proposed.pop(key)
+                    if type(value) is not bool:raise ValueError('Invalid recent history metadata')
+                    meta['_'+key]=value
         plan = guard_personal_query(validate_plan(proposed), text)
         plan.update(meta)
         if plan['route'] == 'lookup' and plan['memory_query'] is None and explicit_preference_recall(text):
@@ -280,6 +304,12 @@ class ReadOnlySession:
             natural = natural_response_enabled(self.conn)
             memory = getattr(self.conn, 'memory', None)
             managed = getattr(memory, 'managed', False)
+            if managed and memory_event and getattr(memory,'recent_context_enabled',False):
+                try:
+                    packet['recent_turn']=await asyncio.to_thread(
+                        memory.record_recent_user,memory_event,self.conn.session_id)
+                except Exception as exc:
+                    trace['recent_checkpoint_error']=type(exc).__name__
             control = await memory.control(text, memory_event or {}) if managed else None
             direct = self.grounded(text)
             if control is not None:
@@ -300,6 +330,8 @@ class ReadOnlySession:
                 trace["router_ms"] = round((time.perf_counter() - start) * 1000)
                 route = plan["route"]
                 if natural:packet['related_context_needed'] = plan.get('_related_context_needed',False)
+                if natural:packet['assistant_history_needed'] = plan.get('_assistant_history_needed',False)
+                if natural:packet['recent_context_needed'] = plan.get('_recent_context_needed',False)
                 if plan.get("memory_query"):
                     # Read the canonical facts in chat immediately before TTS,
                     # not an answer invented or cached by the intent model.
@@ -361,6 +393,8 @@ class ReadOnlySession:
             if natural:
                 trace.update(user_fact_statement=plan.get('_user_fact_statement',False),
                              related_context_needed=packet.get('related_context_needed',False),
+                             recent_context_needed=packet.get('recent_context_needed',False),
+                             assistant_history_needed=packet.get('assistant_history_needed',False),
                              memory_write_queued=bool(packet.get('memory_job')))
             packet["route"] = plan["route"]
             self.last_trace = trace

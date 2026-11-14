@@ -451,6 +451,33 @@ class ManagedMemory:
         self.last_job=self.engine.ingest(self.scope,event)
         return self.last_job
 
+    @property
+    def recent_context_enabled(self):
+        return bool(self.scope and self.config.get('recent_context_enabled') is True)
+
+    def record_recent_user(self, event, session_id):
+        if not self.recent_context_enabled:return None
+        text=speech(event.get('text',''))
+        if (not event.get('id') or event.get('role')!='user'
+                or event.get('origin') not in ('asr','user_text')
+                or event.get('is_temporary') or event.get('is_runtime_event')
+                or not isinstance(session_id,str) or not session_id
+                or not 1<=len(text)<=3000
+                or re.search(r'api.?key|sk-[a-z0-9]{8,}|密码|密钥|access.?token',text,re.I)):
+            return None
+        return self.engine.store.recent_append(self.scope,session_id,event['id'],text)
+
+    def record_recent_reply(self, reference, text=None, status='queued'):
+        if not self.recent_context_enabled or not reference:return False
+        if text is not None:
+            if not isinstance(text,str) or not 1<=len(text)<=1000:return False
+            if re.search(r'api.?key|sk-[a-z0-9]{8,}|密码|密钥|access.?token',text,re.I):return False
+        return self.engine.store.recent_reply(self.scope,reference,text,status)
+
+    def recent_context(self, session_id):
+        if not self.recent_context_enabled:return {'status':'disabled','turns':[]}
+        return self.engine.store.recent_snapshot(self.scope,session_id)
+
     async def query_memory(self,query):
         return await self.engine.recall(self.scope,query)
 

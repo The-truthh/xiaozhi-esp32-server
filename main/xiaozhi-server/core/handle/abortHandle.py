@@ -1,5 +1,6 @@
 import json
 import uuid
+import asyncio
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,6 +13,13 @@ async def handleAbortMessage(conn: "ConnectionHandler"):
     # 设置成打断状态，会自动打断llm、tts任务
     conn.close_after_chat = False
     conn.client_abort = True
+    pending=getattr(conn,'_recent_reply_delivery',None)
+    if pending:
+        try:
+            await asyncio.to_thread(conn.memory.record_recent_reply,pending[1],status='interrupted')
+        except Exception as exc:
+            conn.logger.bind(tag=TAG).warning('近期打断状态保存不可用: '+type(exc).__name__)
+        if getattr(conn,'_recent_reply_delivery',None)==pending:conn._recent_reply_delivery=None
     if hasattr(conn, "information_session"):
         conn.information_session.invalidate()
     cancel_audio = None

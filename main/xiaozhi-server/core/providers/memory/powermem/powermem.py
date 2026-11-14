@@ -221,6 +221,21 @@ class MemoryProvider(MemoryProviderBase):
             raise PermissionError('Personal memory is unavailable for this device')
         return self._managed.facts()
 
+    @property
+    def recent_context_enabled(self):
+        return bool(getattr(self,'managed',False) and not self._memory_scope_denied
+                    and self._managed and self._managed.recent_context_enabled)
+
+    def recent_context(self, session_id):
+        if not self.recent_context_enabled:return {'status':'unavailable','turns':[]}
+        return self._managed.recent_context(session_id)
+
+    def record_recent_user(self, event, session_id):
+        if self.recent_context_enabled:return self._managed.record_recent_user(event,session_id)
+
+    def record_recent_reply(self, reference, text=None, status='queued'):
+        if self.recent_context_enabled:return self._managed.record_recent_reply(reference,text,status)
+
     def query_catalog(self):
         if self._memory_scope_denied or not getattr(self, 'managed', False) or not self._managed:
             raise PermissionError('Personal memory is unavailable for this device')

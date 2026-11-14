@@ -1585,6 +1585,16 @@ class ConnectionHandler:
                 role="assistant", content=text_buff,
                 is_runtime_event=bool((lookup_context or {}).get("runtime_event")),
             ))
+            # Persist generated wording separately from playback completion.
+            # Missing TTS completion remains queued; it is never a shared promise.
+            recent_ref=(lookup_context or {}).get('recent_turn')
+            if (recent_ref and not self.client_abort
+                    and not (lookup_context or {}).get('runtime_event')):
+                try:
+                    if self.memory.record_recent_reply(recent_ref,text_buff):
+                        self._recent_reply_delivery=(current_sentence_id,recent_ref)
+                except Exception as exc:
+                    self.logger.bind(tag=TAG).warning('近期回复保存不可用: '+type(exc).__name__)
 
         if depth == 0:
             self.tts.tts_text_queue.put(

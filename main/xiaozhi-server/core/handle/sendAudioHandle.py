@@ -130,6 +130,8 @@ async def sendAudio(
     if audios is None or len(audios) == 0:
         return
 
+    conn._recent_audio_sentence = conn.sentence_id
+
     send_delay_ms = conn.config.get("tts_audio_send_delay", 0)
     is_single_packet = isinstance(audios, bytes)
 
@@ -315,6 +317,15 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None):
 
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
+    if state == 'stop' and not conn.client_abort:
+        pending=getattr(conn,'_recent_reply_delivery',None)
+        if (pending and pending[0] == current_sentence_id
+                and getattr(conn,'_recent_audio_sentence',None) == current_sentence_id):
+            try:
+                await asyncio.to_thread(conn.memory.record_recent_reply,pending[1],status='audio_sent')
+                if getattr(conn,'_recent_reply_delivery',None)==pending:conn._recent_reply_delivery=None
+            except Exception as exc:
+                conn.logger.bind(tag=TAG).warning('近期语音发送状态保存不可用: '+type(exc).__name__)
 
 
 async def send_stt_message(conn: "ConnectionHandler", text):
