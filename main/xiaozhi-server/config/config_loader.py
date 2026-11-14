@@ -1,3 +1,4 @@
+from config.log_safety import safe_diagnostic
 import os
 import asyncio
 import yaml
@@ -144,7 +145,7 @@ def ensure_directories(config):
         try:
             os.makedirs(dir_path, exist_ok=True)
         except PermissionError:
-            print(f"警告：无法创建目录 {dir_path}，请检查写入权限")
+            safe_diagnostic()
 
 
 def merge_configs(default_config, custom_config):

@@ -1,3 +1,4 @@
+from config.log_safety import safe_diagnostic
 from abc import ABC, abstractmethod
 from config.logger import setup_logging
 
@@ -18,7 +19,7 @@ class MemoryProviderBase(ABC):
     @abstractmethod
     async def save_memory(self, msgs, session_id=None):
         """Save a new memory for specific role and return memory ID"""
-        print("this is base func", msgs)
+        safe_diagnostic()
 
     @abstractmethod
     async def query_memory(self, query: str) -> str:
