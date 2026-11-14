@@ -15,6 +15,14 @@ def natural_response_enabled(conn):
     return conn.config.get('Memory', {}).get(selected, {}).get('natural_response_enabled') is True
 
 
+def model_reply_enabled(conn):
+    """Router metadata/receipts are needed for either opt-in generated reply path."""
+    if natural_response_enabled(conn):
+        return True
+    from core.utils.companion_response import select_reply_policy
+    return select_reply_policy(conn) is not None
+
+
 def recent_conversations(conn, include_assistant=False):
     memory=getattr(conn,'memory',None)
     if not getattr(memory,'recent_context_enabled',False):return {'status':'disabled','turns':[]}
@@ -220,16 +228,21 @@ def _compose_reply(conn, messages, data, draft):
 
 
 def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
-                            runtime_capabilities=None):
+                            runtime_capabilities=None, reply_policy=None, sentence_id=None):
     """One generated utterance for chat, reads and operations; no literal fallback.
 
-    The independent existing intent LLM organizes a final reply with the same
-    evidence and history; the role draft is optional style context, not truth.
+    The opt-in direct strategy gives evidence/history to the final role author.
+    Otherwise the existing intent LLM composes the reply, with an optional role
+    draft as style context. Neither a draft nor a prior reply is factual proof.
     Buffer until content versions and cancellation are checked; retry a genuine
     concurrent change once. Outbox progress alone cannot invalidate delivery.
     """
     packet = packet or {}
+    direct = reply_policy is not None and reply_policy.strategy == 'role_direct'
     def current():
+        if direct:
+            from core.utils.companion_response import reply_is_current
+            return reply_is_current(conn, packet, sentence_id)
         return not conn.client_abort and (not packet or packet.get('generation') == conn.lookup_generation)
     memory = getattr(conn, 'memory', None)
     managed = bool(getattr(memory, 'managed', False))
@@ -325,18 +338,23 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
         data['runtime_capabilities'] = capabilities
         # Recompile fresh per attempt: do not carry stale assembled memory or a
         # fixed technical answer into a retry. Stored dialogue remains auditable.
-        messages = conn.dialogue.get_llm_dialogue_with_memory(
-            '', conn.config.get('voiceprint', {}), speaker, repair_rejected_naming=True,
-            runtime_capabilities=capabilities)
-        if query is not None and (not messages or messages[-1].get('role') != 'user'
-                                   or messages[-1].get('content') != query):
-            messages.append({'role':'user','content':query})
-        context = TURN_RULES+'\n<current_turn_data>\n'+json.dumps(data,ensure_ascii=False).replace('<','\\u003c')+'\n</current_turn_data>'
-        # A system context directly before the real current user turn provides
-        # the latest read, without replacing the question by a backend script.
-        position = len(messages)-1 if messages and messages[-1]['role']=='user' else len(messages)
-        messages.insert(position, {'role':'system','content':context})
         try:
+            if direct:
+                from core.utils.companion_response import build_reply_messages, generate_role_reply
+                request = build_reply_messages(conn, data, reply_policy, speaker)
+                answer = generate_role_reply(conn, request, reply_policy, packet, sentence_id)
+                if answer is None:
+                    return
+            else:
+                messages = conn.dialogue.get_llm_dialogue_with_memory(
+                    '', conn.config.get('voiceprint', {}), speaker, repair_rejected_naming=True,
+                    runtime_capabilities=capabilities)
+                if query is not None and (not messages or messages[-1].get('role') != 'user'
+                                           or messages[-1].get('content') != query):
+                    messages.append({'role':'user','content':query})
+                context = TURN_RULES+'\n<current_turn_data>\n'+json.dumps(data,ensure_ascii=False).replace('<','\\u003c')+'\n</current_turn_data>'
+                position = len(messages)-1 if messages and messages[-1]['role']=='user' else len(messages)
+                messages.insert(position, {'role':'system','content':context})
             draft = ''
             # Reads/operations are composed directly from the actual data and
             # frozen persona. Passing a character model's guessed biography as
@@ -344,20 +362,24 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
             # Historical evidence is also a grounded read. A character draft
             # repeatedly added fictional plot and the composer copied it as if
             # it had been said last time. Compose straight from the raw turns.
-            if not field and not operation and not data['tool_results'] and not data['recent_conversations'].get('turns'):
+            if (not direct and (reply_policy is None or reply_policy.character_draft_enabled)
+                    and not field and not operation and not data['tool_results']
+                    and not data['recent_conversations'].get('turns')):
                 try:
                     draft = ''.join(conn.llm.response(conn.session_id, messages, max_tokens=256, timeout=12)).strip()
                 except Exception as exc:
                     conn.logger.bind(tag='natural_response').warning('角色草稿不可用，继续依据资料组织: '+type(exc).__name__)
             if not current():return
-            answer, review = _compose_reply(conn,messages,data,draft)
+            if not direct:
+                answer, review = _compose_reply(conn,messages,data,draft)
             if not current():return
             if managed and token is not None and token != memory.delivery_token(references):
                 conn.logger.bind(tag='natural_response').info('事实版本变化，重新读取并生成')
                 continue
-            conn.logger.bind(tag='natural_response').info('统一角色回答: '+json.dumps({
+            conn.logger.bind(tag='natural_response').info('角色回答交付: '+json.dumps({
                 'route':packet.get('route'),'read_status':(read or {}).get('status'),
-                'review_revised':not review['valid'],'attempt':attempt+1},ensure_ascii=False))
+                'strategy':reply_policy.strategy if direct else 'legacy',
+                'review_revised':None if direct else not review['valid'],'attempt':attempt+1},ensure_ascii=False))
             yield answer
             return
         except Exception as exc:

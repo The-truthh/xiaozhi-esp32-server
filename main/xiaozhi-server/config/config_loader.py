@@ -1,6 +1,7 @@
 from config.log_safety import safe_diagnostic
 import os
 import asyncio
+from copy import deepcopy
 import yaml
 from collections.abc import Mapping
 from config.manage_api_client import (
@@ -82,6 +83,10 @@ async def get_config_from_api_async(config):
     # 如果服务器没有prompt_template，则从本地配置读取
     if not config_data.get("prompt_template"):
         config_data["prompt_template"] = config.get("prompt_template")
+    # Operator-owned, explicitly scoped quality rollout; also works with manager-api.
+    # An absent local key leaves the server configuration unchanged.
+    if "dialogue_quality" in config:
+        config_data["dialogue_quality"] = deepcopy(config["dialogue_quality"])
     return config_data
 
 

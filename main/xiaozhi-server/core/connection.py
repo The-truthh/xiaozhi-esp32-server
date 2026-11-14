@@ -1138,10 +1138,16 @@ class ConnectionHandler:
                 functions.append(DIRECT_ANSWER_TOOL)
 
         response_message = []
+        reply_policy = None
 
         try:
             # 使用带记忆的对话
             from core.utils.information_response import natural_response_enabled, natural_reply_responses
+            from core.utils.companion_response import select_reply_policy, finalize_role_reply, reply_is_current
+            if depth == 0:
+                reply_policy = select_reply_policy(self)
+                if reply_policy is not None and lookup_context is None:
+                    lookup_context = {'generation': getattr(self, 'lookup_generation', None)}
             memory_str = None
             layered_memory = bool(getattr(self.memory, 'layered_context', False))
             core_memory = None
@@ -1153,7 +1159,7 @@ class ConnectionHandler:
                     self.logger.bind(tag=TAG).warning(f'核心记忆读取不可用: {type(exc).__name__}')
             # 仅当query非空（代表用户询问）时查询记忆
             skip_memory = (lookup_context or {}).get('route') in ('grounded','memory','memory_query','lookup','clarify','cancel','unsupported')
-            if natural_response_enabled(self) and not (lookup_context or {}).get('related_context_needed',False):
+            if (natural_response_enabled(self) or reply_policy is not None) and not (lookup_context or {}).get('related_context_needed',False):
                 # Broad semantic matches pulled music preferences into a new
                 # painting topic. Core identity stays independent; explicit
                 # personal questions use canonical reads, and continuity cues
@@ -1229,10 +1235,15 @@ class ConnectionHandler:
                 self.dialogue.get_naming_grounded_response()
                 if depth == 0 and (self.intent_type == "nointent" or lookup_context) else None
             )
-            if depth == 0 and natural_response_enabled(self):
+            if depth == 0 and reply_policy is not None and reply_policy.strategy == 'role_direct':
                 llm_responses = natural_reply_responses(
                     self, lookup_context, memory_str, speaker_for_system, query=query,
-                    runtime_capabilities=runtime_capabilities)
+                    runtime_capabilities=runtime_capabilities, reply_policy=reply_policy,
+                    sentence_id=current_sentence_id)
+            elif depth == 0 and (natural_response_enabled(self) or reply_policy is not None):
+                llm_responses = natural_reply_responses(
+                    self, lookup_context, memory_str, speaker_for_system, query=query,
+                    runtime_capabilities=runtime_capabilities, reply_policy=reply_policy)
             elif lookup_context and lookup_context.get('memory_query'):
                 def personal_fact_responses():
                     # Resolve lazily at delivery, not when the intent model
@@ -1363,6 +1374,9 @@ class ConnectionHandler:
         try:
             for response in llm_responses:
                 if self.client_abort or (lookup_context and lookup_context["generation"] != getattr(self, "lookup_generation", None)):
+                    break
+                if (reply_policy is not None and reply_policy.strategy == 'role_direct'
+                        and not reply_is_current(self, lookup_context, current_sentence_id)):
                     break
                 if self.intent_type == "function_call" and functions is not None:
                     content, tools_call = response
@@ -1584,25 +1598,27 @@ class ConnectionHandler:
             return None
         if len(response_message) > 0:
             text_buff = "".join(response_message)
-            self.tts.store_tts_text(current_sentence_id, text_buff)
-            self.dialogue.put(Message(
-                role="assistant", content=text_buff,
-                is_runtime_event=bool((lookup_context or {}).get("runtime_event")),
-                turn_id=current_sentence_id,
-                delivery_status=("interrupted" if self.client_abort
-                                 or current_sentence_id != self.sentence_id
-                                 else "generated"),
-            ))
-            # Persist generated wording separately from playback completion.
-            # Missing TTS completion remains queued; it is never a shared promise.
-            recent_ref=(lookup_context or {}).get('recent_turn')
-            if (recent_ref and not self.client_abort
-                    and not (lookup_context or {}).get('runtime_event')):
-                try:
-                    if self.memory.record_recent_reply(recent_ref,text_buff):
-                        self._recent_reply_delivery=(current_sentence_id,recent_ref)
-                except Exception as exc:
-                    self.logger.bind(tag=TAG).warning('近期回复保存不可用: '+type(exc).__name__)
+            if reply_policy is not None and reply_policy.strategy == 'role_direct':
+                finalize_role_reply(self, text_buff, current_sentence_id, lookup_context, reply_policy)
+            else:
+                self.tts.store_tts_text(current_sentence_id, text_buff)
+                self.dialogue.put(Message(
+                    role="assistant", content=text_buff,
+                    is_runtime_event=bool((lookup_context or {}).get("runtime_event")),
+                    turn_id=current_sentence_id,
+                    delivery_status=("interrupted" if self.client_abort
+                                     or current_sentence_id != self.sentence_id
+                                     else "generated"),
+                ))
+                # Missing TTS completion remains queued, never a shared promise.
+                recent_ref=(lookup_context or {}).get('recent_turn')
+                if (recent_ref and not self.client_abort
+                        and not (lookup_context or {}).get('runtime_event')):
+                    try:
+                        if self.memory.record_recent_reply(recent_ref,text_buff):
+                            self._recent_reply_delivery=(current_sentence_id,recent_ref)
+                    except Exception as exc:
+                        self.logger.bind(tag=TAG).warning('近期回复保存不可用: '+type(exc).__name__)
 
         if depth == 0:
             self.tts.tts_text_queue.put(
