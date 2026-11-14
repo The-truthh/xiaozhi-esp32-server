@@ -231,8 +231,18 @@ class ReadOnlySession:
             schema['required'].append('dialogue_update')
             payload['topic_catalog'] = topic_extension['catalog']
             prompt += ROUTER_TOPIC_RULES
+        user_payload = json.dumps(payload, ensure_ascii=False)
+        if natural and (self.conn.config.get('dialogue_quality') or {}).get('strategy') == 'hybrid':
+            prompt += ('\n当前只判断本轮用户原话。history、recent_conversations、topic_catalog和lookup_state'
+                '用于理解指代，不是本轮请求；上一轮已回答的记忆或查询问题不能自动延续为本轮任务。'
+                '用户现在分享生活、提供偏好、表达心情或转回聊天时走chat，只有本轮实际询问才查记忆或公开资料。'
+                '只有明确省略指代的追问才沿用查询任务；天气缺少已确认的城市时返回clarify(location)，不能返回缺城市的lookup。')
+            # Keep the current utterance after the potentially large history,
+            # in the user message rather than promoting it to system authority.
+            background = {k: v for k, v in payload.items() if k != 'user'}
+            user_payload = json.dumps({'background': background, 'current_user_utterance': speech(text)}, ensure_ascii=False)
         raw = await asyncio.wait_for(asyncio.to_thread(
-            llm.response_structured, prompt, json.dumps(payload, ensure_ascii=False), schema,
+            llm.response_structured, prompt, user_payload, schema,
             timeout=6), timeout=7)
         proposed = json.loads(raw)
         meta = {}

@@ -136,13 +136,13 @@ class LLMProvider(LLMProviderBase):
         finally:
             responses.close()
 
-    def response_structured(self, system_prompt, user_prompt, schema, timeout=6):
+    def response_structured(self, system_prompt, user_prompt, schema, timeout=6, temperature=0):
         """Bounded independent routing call; ordinary character generation is unchanged."""
         params = {
             "model": self.model_name,
             "messages": [{"role": "system", "content": system_prompt},
                          {"role": "user", "content": user_prompt}],
-            "temperature": 0,
+            "temperature": temperature,
             "max_tokens": self.max_tokens or 512,
             "response_format": {"type": "json_schema", "json_schema": {
                 "name": "information_route", "strict": True, "schema": schema}},

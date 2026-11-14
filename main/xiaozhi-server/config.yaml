@@ -69,9 +69,13 @@ tool_call_timeout: 30
 # strategy: legacy=原整理链路，role_direct=最终作者直接生成；不修改角色卡。
 dialogue_quality:
   enabled: false
-  strategy: legacy
+  strategy: legacy  # legacy / role_direct / hybrid（按本轮意图选择最终发言链路）
   final_model: character  # character=当前角色LLM；intent=意图模型仅作为最终发言对照
   character_draft_enabled: true  # 仅legacy路径：false跳过可选草稿，最终Flash及交付检查保留
+  # hybrid专用：按请求覆盖，不修改共享模型对象；意图识别和后台观察仍使用原温度。
+  temperature: 0.4
+  draft_temperature: 0.7
+  composer_temperature: 0.4
   allowed_device_ids: []
   allowed_subject_scopes: []
   max_input_chars: 24000
@@ -123,6 +127,7 @@ companion_speech:
   allowed_device_ids: []
   allowed_subject_scopes: []
   mode: natural
+  planning: rules  # rules=既有读法；model=最终Flash同次生成语气计划，须单独听评后启用
   slow_rate: 0.85
   fast_rate: 1.15
   ttl_seconds: 60

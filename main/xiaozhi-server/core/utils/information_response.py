@@ -150,7 +150,7 @@ def delivery_tool_results(bundles, utterance):
     return selected
 
 
-def _compose_reply(conn, messages, data, draft):
+def _compose_reply(conn, messages, data, draft, reply_policy=None):
     from core.utils.companion_expression import select_dialogue_policy, spoken_format_feedback
     q4_enabled = select_dialogue_policy(conn) is not None
     # A rejected style draft is not evidence. Refeeding its full text on every
@@ -188,9 +188,12 @@ def _compose_reply(conn, messages, data, draft):
         from core.utils.speech_plan import PLAN_SCHEMA,PLAN_RULES
         schema=deepcopy(REVIEW_SCHEMA);schema['properties']['speech_plan']=deepcopy(PLAN_SCHEMA)
         schema['required'].append('speech_plan');plan_rules=PLAN_RULES
+    params = {'timeout': 8}
+    if reply_policy is not None and reply_policy.composer_temperature is not None:
+        params['temperature'] = reply_policy.composer_temperature
     for attempt in range(2):
         raw = conn.intent.llm.response_structured(messages[0]['content']+'\n'+REVIEW_RULES+author_rules+plan_rules,
-            json.dumps(payload,ensure_ascii=False), schema, timeout=8)
+            json.dumps(payload,ensure_ascii=False), schema, **params)
         try:
             result = json.loads(raw)
             base_fields=set(REVIEW_SCHEMA['required'])
@@ -422,12 +425,15 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
                     and not field and not operation and not data['tool_results']
                     and not data['recent_conversations'].get('turns')):
                 try:
-                    draft = ''.join(conn.llm.response(conn.session_id, messages, max_tokens=256, timeout=12)).strip()
+                    draft_params = dict(max_tokens=256, timeout=12)
+                    if reply_policy is not None and reply_policy.draft_temperature is not None:
+                        draft_params['temperature'] = reply_policy.draft_temperature
+                    draft = ''.join(conn.llm.response(conn.session_id, messages, **draft_params)).strip()
                 except Exception as exc:
                     conn.logger.bind(tag='natural_response').warning('角色草稿不可用，继续依据资料组织: '+type(exc).__name__)
             if not current():return
             if not direct:
-                answer, review = _compose_reply(conn,messages,data,draft)
+                answer, review = _compose_reply(conn,messages,data,draft,reply_policy)
                 if answer is None:return
             if not current():return
             if managed and token is not None and token != memory.delivery_token(references):

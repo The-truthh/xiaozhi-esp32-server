@@ -1154,7 +1154,7 @@ class ConnectionHandler:
             from core.utils.information_response import natural_response_enabled, natural_reply_responses
             from core.utils.companion_response import select_reply_policy, finalize_role_reply, reply_is_current
             if depth == 0:
-                reply_policy = select_reply_policy(self)
+                reply_policy = select_reply_policy(self, lookup_context or {})
                 if reply_policy is not None and lookup_context is None:
                     lookup_context = {'generation': getattr(self, 'lookup_generation', None)}
             memory_str = None

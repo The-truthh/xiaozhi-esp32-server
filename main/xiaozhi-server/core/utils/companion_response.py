@@ -28,6 +28,11 @@ class ReplyPolicy:
     max_history_messages: int = 24
     max_output_tokens: int = 512
     timeout: float = 15
+    # None preserves the provider's original behavior outside hybrid mode.
+    temperature: float = None
+    draft_temperature: float = None
+    composer_temperature: float = None
+    routing_reason: str = ''
 
 
 @dataclass
@@ -44,7 +49,7 @@ def _log(conn, level, message):
             method(message)
 
 
-def select_reply_policy(conn):
+def select_reply_policy(conn, packet=None):
     """Allowlist uses authenticated connection/configured subject, never headers as a subject."""
     config = getattr(conn, 'config', {}).get('dialogue_quality')
     if not isinstance(config, dict) or config.get('enabled') is not True:
@@ -71,7 +76,7 @@ def select_reply_policy(conn):
     try:
         strategy = config.get('strategy', 'legacy')
         final_model = config.get('final_model', 'character')
-        if strategy not in ('legacy', 'role_direct') or final_model not in ('character', 'intent'):
+        if strategy not in ('legacy', 'role_direct', 'hybrid') or final_model not in ('character', 'intent'):
             raise ValueError('strategy')
         character_draft_enabled = config.get('character_draft_enabled', True)
         if type(character_draft_enabled) is not bool:
@@ -91,11 +96,51 @@ def select_reply_policy(conn):
             if key != 'timeout' and type(value) is not int:
                 raise ValueError(key)
             values[key] = value
+        if strategy == 'hybrid':
+            temperatures = {}
+            for key, default in (('temperature', .4), ('draft_temperature', .7),
+                                 ('composer_temperature', .4)):
+                value = config.get(key, default)
+                if type(value) not in (int, float) or not 0 <= value <= 2:
+                    raise ValueError(key)
+                temperatures[key] = value
+            selected, reason = hybrid_route(packet or {})
+            if selected == 'legacy' and intent_type == 'nointent':
+                raise ValueError('hybrid factual route requires intent model')
+            policy = ReplyPolicy(strategy=selected, final_model='character',
+                character_draft_enabled=character_draft_enabled,
+                routing_reason=reason, **temperatures, **values)
+            # Eligibility probes have no packet; only log actual decisions.
+            if packet is not None:
+                _log(conn, 'info', '回答链路选择: ' + json.dumps({
+                    'strategy': selected, 'reason': reason,
+                    'route': packet.get('route'), 'temperature': policy.temperature
+                    if selected == 'role_direct' else policy.composer_temperature}))
+            return policy
         return ReplyPolicy(strategy=strategy, final_model=final_model,
                            character_draft_enabled=character_draft_enabled, **values)
     except (TypeError, ValueError):
         _log(conn, 'warning', '对话质量配置未启用：策略或预算格式无效')
         return None
+
+
+def hybrid_route(packet):
+    """Use the validated turn packet, never keywords, a new LLM call or shared state.
+
+    Background core/related memories do not make ordinary conversation a recall
+    task. Actual reads, tool evidence and operation receipts take precedence.
+    Grounded naming/greeting events are conversational, unlike factual results.
+    """
+    if packet.get('memory_query') or packet.get('assistant_history_needed'):
+        return 'legacy', 'explicit_memory_read'
+    if packet.get('evidence') or packet.get('operation'):
+        return 'legacy', 'evidence_or_operation'
+    route = packet.get('route', 'chat')
+    if route == 'grounded' and packet.get('conversation_event'):
+        return 'role_direct', 'conversation_event'
+    if route != 'chat':
+        return 'legacy', 'factual_or_control_route'
+    return 'role_direct', 'ordinary_conversation'
 
 
 def reply_is_current(conn, packet, sentence_id=None):
@@ -210,8 +255,10 @@ def generate_role_reply(conn, request, policy, packet, sentence_id=None, _format
         raise ValueError('Final author unavailable')
     _log(conn, 'info', '角色发言请求: ' + json.dumps(dict(
         request.diagnostics, model=getattr(model, 'model_name', policy.final_model)), ensure_ascii=False))
-    stream = model.response(conn.session_id, request.messages,
-                            max_tokens=policy.max_output_tokens, timeout=policy.timeout)
+    params = dict(max_tokens=policy.max_output_tokens, timeout=policy.timeout)
+    if policy.temperature is not None:
+        params['temperature'] = policy.temperature
+    stream = model.response(conn.session_id, request.messages, **params)
     chunks = []
     try:
         for chunk in stream:

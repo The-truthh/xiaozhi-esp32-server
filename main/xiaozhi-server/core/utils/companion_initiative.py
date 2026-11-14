@@ -289,7 +289,7 @@ class InitiativeRuntime:
     self.store.settle(ticket,'cancelled');return
    c.sentence_id=sid
    c.client_abort=False
-   policy=select_reply_policy(c)
+   policy=select_reply_policy(c,packet)
    # Generation runs in the same author path, but never calls chat(query=None)
    # (which would append a fabricated user message to native history).
    def author():return list(natural_reply_responses(c,packet,'',query=None,reply_policy=policy,sentence_id=sid))
