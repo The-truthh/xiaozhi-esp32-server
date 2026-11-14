@@ -135,6 +135,23 @@ class LLMProvider(LLMProviderBase):
         finally:
             responses.close()
 
+    def response_structured(self, system_prompt, user_prompt, schema, timeout=6):
+        """Bounded independent routing call; ordinary character generation is unchanged."""
+        params = {
+            "model": self.model_name,
+            "messages": [{"role": "system", "content": system_prompt},
+                         {"role": "user", "content": user_prompt}],
+            "temperature": 0,
+            "max_tokens": self.max_tokens or 512,
+            "response_format": {"type": "json_schema", "json_schema": {
+                "name": "information_route", "strict": True, "schema": schema}},
+        }
+        self._apply_thinking_disabled(params)
+        response = self.client.with_options(timeout=timeout, max_retries=0).chat.completions.create(**params)
+        if response.choices[0].finish_reason != "stop":
+            raise ValueError("Incomplete routing response")
+        return response.choices[0].message.content
+
     def response_with_functions(self, session_id, dialogue, functions=None, **kwargs):
         dialogue = self.normalize_dialogue(dialogue)
 

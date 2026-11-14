@@ -95,6 +95,8 @@ class ConnectionHandler:
 
         self.need_bind = False  # 是否需要绑定设备
         self.bind_completed_event = asyncio.Event()
+        self.components_ready_event = asyncio.Event()
+        self.initialization_error = None
         self.bind_code = None  # 绑定设备的验证码
         self.last_bind_prompt_time = 0  # 上次播放绑定提示的时间戳(秒)
         self.bind_prompt_interval = 60  # 绑定提示播放间隔(秒)
@@ -346,6 +348,18 @@ class ConnectionHandler:
             asyncio.create_task(check_bind_device(self))
 
     async def _route_message(self, message):
+        # A resolved binding/config request is not proof that the per-connection
+        # intent LLM, prompt and audio channels have finished initialization.
+        try:
+            await asyncio.wait_for(self.components_ready_event.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            self.logger.bind(tag=TAG).warning("连接组件尚未就绪，关闭连接等待重试")
+            await self.websocket.close(code=1013, reason="服务初始化中，请稍后重连")
+            return
+        if self.initialization_error is not None:
+            await self.websocket.close(code=1011, reason="服务初始化失败，请稍后重连")
+            return
+
         """消息路由"""
         # 检查是否已经获取到真实的绑定状态
         if not self.bind_completed_event.is_set():
@@ -610,7 +624,7 @@ class ConnectionHandler:
             # 打开语音合成通道
             asyncio.run_coroutine_threadsafe(
                 self.tts.open_audio_channels(self), self.loop
-            )
+            ).result(timeout=10)
             if self.need_bind:
                 self.bind_completed_event.set()
                 return
@@ -640,7 +654,7 @@ class ConnectionHandler:
             # 打开语音识别通道
             asyncio.run_coroutine_threadsafe(
                 self.asr.open_audio_channels(self), self.loop
-            )
+            ).result(timeout=10)
 
             """加载记忆"""
             self._initialize_memory()
@@ -654,16 +668,19 @@ class ConnectionHandler:
             self._inject_tool_call_fewshot()
 
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"实例化组件失败: {e}")
+            self.logger.bind(tag=TAG).error(f"实例化组件失败: {type(e).__name__}")
+            raise
 
     def _init_prompt_enhancement(self):
-
+        # SSH/proxy egress is not the user's location. Read-only lookup resolves
+        # weather only from an explicit city, including the background context.
+        context_ip = None if getattr(self.intent, "read_only", False) else self.client_ip
         # 更新上下文信息
-        self.prompt_manager.update_context_info(self, self.client_ip)
+        self.prompt_manager.update_context_info(self, context_ip)
         enhanced_prompt = self.prompt_manager.build_enhanced_prompt(
             self.config["prompt"],
             self.device_id,
-            self.client_ip,
+            context_ip,
             emoji_enabled=(self.features or {}).get("emoji", True),
         )
         if enhanced_prompt:
@@ -793,9 +810,13 @@ class ConnectionHandler:
             # 异步获取差异化配置
             await self._initialize_private_config_async()
             # 在线程池中初始化组件
-            self.executor.submit(self._initialize_components)
+            await self.loop.run_in_executor(self.executor, self._initialize_components)
         except Exception as e:
-            self.logger.bind(tag=TAG).error(f"后台初始化失败: {e}")
+            self.initialization_error = type(e).__name__
+            self.logger.bind(tag=TAG).error(f"后台初始化失败: {self.initialization_error}")
+        finally:
+            # Set on the event loop, after the worker and channel setup finish.
+            self.components_ready_event.set()
 
     async def _initialize_private_config_async(self):
         """从接口异步获取差异化配置（异步版本，不阻塞主循环）"""
@@ -1040,6 +1061,11 @@ class ConnectionHandler:
                 self.intent.set_llm(self.llm)
                 self.logger.bind(tag=TAG).info("使用主LLM作为意图识别模型")
 
+        # Read-only workflow dispatches only its three bounded information reads;
+        # do not initialize MCP/IoT/action executors or inherited music bindings.
+        if getattr(self.intent, "read_only", False):
+            return
+
         """加载统一工具处理器"""
         self.func_handler = UnifiedToolHandler(self)
 
@@ -1052,7 +1078,9 @@ class ConnectionHandler:
         # 更新系统prompt至上下文
         self.dialogue.update_system_message(self.prompt)
 
-    def chat(self, query, depth=0):
+    def chat(self, query, depth=0, lookup_context=None):
+        if lookup_context and lookup_context["generation"] != getattr(self, "lookup_generation", None):
+            return None
         # 保存当前任务的sentence_id到局部变量，避免被新任务覆盖
         current_sentence_id = None
 
@@ -1063,7 +1091,10 @@ class ConnectionHandler:
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
-            self.dialogue.put(Message(role="user", content=query))
+            self.dialogue.put(Message(
+                role="user", content=query,
+                is_runtime_event=bool((lookup_context or {}).get("runtime_event")),
+            ))
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
@@ -1131,20 +1162,32 @@ class ConnectionHandler:
             runtime_capabilities = build_runtime_capabilities(
                 self.config, functions, memory_str, self.intent_type
             )
+            if lookup_context and lookup_context.get("evidence"):
+                runtime_capabilities["information_lookup"] = {
+                    "status": "实际读取结果见本轮资料；失败不代表查到",
+                    "available_topics": ["news", "weather", "general"],
+                    "side_effect_tools": "unavailable",
+                }
             llm_dialogue = self.dialogue.get_llm_dialogue_with_memory(
                 memory_str, self.config.get("voiceprint", {}), speaker_for_system,
                 runtime_capabilities=runtime_capabilities,
                 repair_rejected_naming=True,
+                information_context=(lookup_context or {}).get("evidence"),
             )
 
             grounded_response = (
                 self.dialogue.get_naming_grounded_response()
-                if depth == 0 and self.intent_type == "nointent" else None
+                if depth == 0 and (self.intent_type == "nointent" or lookup_context) else None
             )
-            if grounded_response is not None:
+            if lookup_context and lookup_context.get("direct_response"):
+                llm_responses = iter([lookup_context["direct_response"]])
+            elif grounded_response is not None:
                 # Use the same history and TTS pipeline; don't generate a fake
                 # source for user statements that the application can quote.
                 llm_responses = iter([grounded_response])
+            elif lookup_context and lookup_context.get("evidence"):
+                from core.utils.information_response import information_reply
+                llm_responses = iter([information_reply(self, llm_dialogue, lookup_context["evidence"])])
             elif self.intent_type == "function_call" and functions is not None:
                 # 使用支持functions的streaming接口
                 llm_responses = self.llm.response_with_functions(
@@ -1169,7 +1212,7 @@ class ConnectionHandler:
         emotion_flag = True
         try:
             for response in llm_responses:
-                if self.client_abort:
+                if self.client_abort or (lookup_context and lookup_context["generation"] != getattr(self, "lookup_generation", None)):
                     break
                 if self.intent_type == "function_call" and functions is not None:
                     content, tools_call = response
@@ -1387,10 +1430,15 @@ class ConnectionHandler:
                     self._handle_function_result(tool_results, depth=depth, streamed_text=streamed_text)
 
         # 存储对话内容
+        if lookup_context and lookup_context["generation"] != getattr(self, "lookup_generation", None):
+            return None
         if len(response_message) > 0:
             text_buff = "".join(response_message)
             self.tts.store_tts_text(current_sentence_id, text_buff)
-            self.dialogue.put(Message(role="assistant", content=text_buff))
+            self.dialogue.put(Message(
+                role="assistant", content=text_buff,
+                is_runtime_event=bool((lookup_context or {}).get("runtime_event")),
+            ))
 
         if depth == 0:
             self.tts.tts_text_queue.put(
@@ -1558,6 +1606,8 @@ class ConnectionHandler:
     async def close(self, ws=None):
         """资源清理方法"""
         try:
+            if hasattr(self, "information_session"):
+                self.information_session.invalidate()
             # 清理 VAD 连接资源
             if (
                     hasattr(self, "vad")

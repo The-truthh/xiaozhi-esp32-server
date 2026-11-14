@@ -129,6 +129,7 @@ class TTSProvider(TTSProviderBase):
 
                 if message.sentence_type == SentenceType.FIRST:
                     # 重置流式处理状态
+                    self.current_sentence_id = message.sentence_id
                     self.reset_stream_state()
                     # 初始化会话
                     try:
@@ -138,7 +139,7 @@ class TTSProvider(TTSProviderBase):
 
                         logger.bind(tag=TAG).debug("开始启动TTS会话...")
                         future = asyncio.run_coroutine_threadsafe(
-                            self.start_session(self.conn.sentence_id),
+                            self.start_session(message.sentence_id),
                             loop=self.conn.loop,
                         )
                         future.result(timeout=self.tts_timeout)
@@ -155,7 +156,7 @@ class TTSProvider(TTSProviderBase):
                                 f"开始发送TTS文本: {message.content_detail}"
                             )
                             future = asyncio.run_coroutine_threadsafe(
-                                self.text_to_speak(message.content_detail, None),
+                                self.text_to_speak(message.content_detail, message.sentence_id),
                                 loop=self.conn.loop,
                             )
                             future.result(timeout=self.tts_timeout)
@@ -175,7 +176,7 @@ class TTSProvider(TTSProviderBase):
                     try:
                         logger.bind(tag=TAG).debug("开始结束TTS会话...")
                         future = asyncio.run_coroutine_threadsafe(
-                            self.finish_session(self.conn.sentence_id),
+                            self.finish_session(message.sentence_id),
                             loop=self.conn.loop,
                         )
                         future.result()
@@ -191,9 +192,11 @@ class TTSProvider(TTSProviderBase):
                 )
                 continue
 
-    async def text_to_speak(self, text, _):
+    async def text_to_speak(self, text, sentence_id):
         """发送文本到TTS服务进行合成"""
         try:
+            if sentence_id and sentence_id != self.conn.sentence_id:
+                return
             if self.ws is None:
                 logger.bind(tag=TAG).warning("WebSocket连接不存在，终止发送文本")
                 return
@@ -207,11 +210,13 @@ class TTSProvider(TTSProviderBase):
 
                 # 发送每个确定的文本片段
                 for txt in confirmed_texts:
+                    if sentence_id and sentence_id != self.conn.sentence_id:
+                        break
                     if txt and self.ws:
                         continue_task_message = {
                             "header": {
                                 "action": "continue-task",
-                                "task_id": self.conn.sentence_id,
+                                "task_id": sentence_id or self.conn.sentence_id,
                                 "streaming": "duplex",
                             },
                             "payload": {"input": {"text": txt}},
@@ -320,6 +325,18 @@ class TTSProvider(TTSProviderBase):
                 pass
             self.ws = None
             self.last_active_time = None
+
+    async def cancel_pending_audio(self):
+        """Binary provider frames have no task ID: close the old upstream stream."""
+        self._downstream_sentence_id = None
+        self.current_sentence_id = None
+        ws = getattr(self, "ws", None)
+        transport = getattr(ws, "transport", None)
+        if transport is not None:
+            # A close handshake can take many seconds while audio is arriving.
+            # This cancelled task must not hold up the next voice turn.
+            transport.abort()
+        await self.close()
     
     async def _cancel_monitor_task(self):
         """取消监听任务"""
@@ -350,12 +367,10 @@ class TTSProvider(TTSProviderBase):
 
                             # 只处理当前活跃会话的响应
                             if task_id and self.conn.sentence_id != task_id:
-                                if event in ["task-finished", "task-failed"]:
-                                    logger.bind(tag=TAG).debug(f"收到残余下行结束响应重置会话状态～～")
-                                    self.activate_session = False
                                 continue
 
                             if event == "task-started":
+                                self._downstream_sentence_id = task_id
                                 logger.bind(tag=TAG).debug("TTS任务启动成功~")
                             elif event == "result-generated":
                                 output = data.get("payload", {}).get("output", {})
@@ -363,7 +378,7 @@ class TTSProvider(TTSProviderBase):
                                     original_text = output.get("original_text")
                                     self.tts_text = self._restore_original_text(original_text)
                                     logger.bind(tag=TAG).debug(f"句子语音生成开始: {self.tts_text}")
-                                    self.tts_audio_queue.put((SentenceType.FIRST, [], self.tts_text))
+                                    self.tts_audio_queue.put((SentenceType.FIRST, [], self.tts_text, task_id))
                                 elif output.get("type") == "sentence-end":
                                     logger.bind(tag=TAG).info(f"句子语音生成成功： {self.tts_text}")
                             elif event == "task-finished":
@@ -380,8 +395,12 @@ class TTSProvider(TTSProviderBase):
                         except json.JSONDecodeError:
                             logger.bind(tag=TAG).warning("收到无效的JSON消息")
                     elif isinstance(msg, (bytes, bytearray)):
+                        task_id = getattr(self, "_downstream_sentence_id", None)
+                        if not task_id or task_id != self.conn.sentence_id or self.conn.client_abort:
+                            continue
                         self.opus_encoder.encode_pcm_to_opus_stream(
-                            msg, False, callback=self.handle_opus
+                            msg, False, callback=lambda packet: self.tts_audio_queue.put(
+                                (SentenceType.MIDDLE, packet, None, task_id))
                         )
                 except websockets.ConnectionClosed:
                     logger.bind(tag=TAG).warning("WebSocket连接已关闭")

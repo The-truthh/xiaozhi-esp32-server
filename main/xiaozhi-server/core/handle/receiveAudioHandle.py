@@ -87,6 +87,24 @@ async def startToChat(conn: "ConnectionHandler", text):
     if conn.client_is_speaking and conn.client_listen_mode != "manual":
         await handleAbortMessage(conn)
 
+    # The read-only workflow owns a cancellable task, so WebSocket input/abort
+    # remains responsive while the independent router or network read is pending.
+    if getattr(conn.intent, "read_only", False):
+        if conn.client_is_speaking:
+            # A new completed turn (including "不查了") supersedes this workflow.
+            await handleAbortMessage(conn)
+        from core.handle.intentHandler import check_direct_exit
+        from core.utils.util import remove_punctuation_and_length
+        _, exit_text = remove_punctuation_and_length(actual_text)
+        if await check_direct_exit(conn, exit_text):
+            return
+        from core.utils.information_router import ReadOnlySession
+        if not hasattr(conn, "information_session"):
+            conn.information_session = ReadOnlySession(conn)
+        await send_stt_message(conn, actual_text)
+        conn.information_session.submit(actual_text)
+        return
+
     # 首先进行意图分析，使用实际文本内容
     intent_handled = await handle_user_intent(conn, actual_text)
 
