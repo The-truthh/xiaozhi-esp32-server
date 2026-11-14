@@ -1243,7 +1243,8 @@ class ConnectionHandler:
             elif depth == 0 and (natural_response_enabled(self) or reply_policy is not None):
                 llm_responses = natural_reply_responses(
                     self, lookup_context, memory_str, speaker_for_system, query=query,
-                    runtime_capabilities=runtime_capabilities, reply_policy=reply_policy)
+                    runtime_capabilities=runtime_capabilities, reply_policy=reply_policy,
+                    sentence_id=current_sentence_id)
             elif lookup_context and lookup_context.get('memory_query'):
                 def personal_fact_responses():
                     # Resolve lazily at delivery, not when the intent model
@@ -1620,6 +1621,10 @@ class ConnectionHandler:
                     except Exception as exc:
                         self.logger.bind(tag=TAG).warning('近期回复保存不可用: '+type(exc).__name__)
 
+            if depth == 0:
+                from core.utils.companion_affect import complete_affect_turn
+                complete_affect_turn(self, text_buff, current_sentence_id, lookup_context)
+
         if depth == 0:
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
@@ -1786,6 +1791,8 @@ class ConnectionHandler:
     async def close(self, ws=None):
         """资源清理方法"""
         try:
+            from core.utils.companion_affect import cancel_affect_turn
+            await asyncio.to_thread(cancel_affect_turn, self)
             if hasattr(self, "information_session"):
                 self.information_session.invalidate()
             # 清理 VAD 连接资源

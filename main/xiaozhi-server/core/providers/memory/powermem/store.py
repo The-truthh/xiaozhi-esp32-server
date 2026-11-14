@@ -311,6 +311,12 @@ class Store:
             # Conservative whole-window withdrawal also applies to field deletion:
             # free-form dialogue may mention the deleted fact through pronouns.
             db.execute('DELETE FROM recent_turns WHERE scope=?', (scope,))
+            # Role feelings are derived from the same interaction window. A
+            # partial forget conservatively withdraws them too; old workers
+            # cannot restore them after the epoch change.
+            for table in ('companion_affect', 'companion_affect_events'):
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    db.execute('DELETE FROM ' + table + ' WHERE scope=?', (scope,))
             # Every old extraction job is fenced; even old sources can no longer
             # be re-extracted after a deletion. This is deliberately conservative.
             db.execute("UPDATE jobs SET state='cancelled',payload='{}' WHERE scope=? "

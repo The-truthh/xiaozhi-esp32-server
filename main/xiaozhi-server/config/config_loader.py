@@ -85,8 +85,9 @@ async def get_config_from_api_async(config):
         config_data["prompt_template"] = config.get("prompt_template")
     # Operator-owned, explicitly scoped quality rollout; also works with manager-api.
     # An absent local key leaves the server configuration unchanged.
-    if "dialogue_quality" in config:
-        config_data["dialogue_quality"] = deepcopy(config["dialogue_quality"])
+    for local_key in ("dialogue_quality", "companion_affect"):
+        if local_key in config:
+            config_data[local_key] = deepcopy(config[local_key])
     return config_data
 
 

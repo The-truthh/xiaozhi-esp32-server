@@ -239,6 +239,8 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
     """
     packet = packet or {}
     direct = reply_policy is not None and reply_policy.strategy == 'role_direct'
+    from core.utils.companion_affect import prepare_affect_turn, affect_context
+    affect_turn = prepare_affect_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
     def current():
         if direct:
             from core.utils.companion_response import reply_is_current
@@ -336,6 +338,9 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
             capabilities.update(memory_provider='unavailable', cross_session_recall='unavailable',
                                 memory_write_this_turn='unavailable')
         data['runtime_capabilities'] = capabilities
+        role_affect = affect_context(conn, affect_turn)
+        if role_affect:
+            data['companion_affect'] = role_affect
         # Recompile fresh per attempt: do not carry stale assembled memory or a
         # fixed technical answer into a retry. Stored dialogue remains auditable.
         try:

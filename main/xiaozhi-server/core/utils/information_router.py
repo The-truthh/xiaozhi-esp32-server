@@ -176,7 +176,7 @@ class ReadOnlySession:
         return generation == getattr(self.conn, "lookup_generation", None) and not self.conn.client_abort
 
     async def plan(self, text):
-        from core.utils.information_response import natural_response_enabled
+        from core.utils.information_response import model_reply_enabled as natural_response_enabled
         natural = natural_response_enabled(self.conn)
         history = [{"role": m.role, "content": speech(m.content or "")[:700]}
                    for m in self.conn.dialogue.dialogue if m.role in ("user", "assistant")
@@ -302,7 +302,7 @@ class ReadOnlySession:
                   "input_origin": (memory_event or {}).get("origin", "unknown")}
         trace = {"generation": generation}
         try:
-            from core.utils.information_response import natural_response_enabled
+            from core.utils.information_response import model_reply_enabled as natural_response_enabled
             natural = natural_response_enabled(self.conn)
             memory = getattr(self.conn, 'memory', None)
             managed = getattr(memory, 'managed', False)
@@ -416,7 +416,7 @@ class ReadOnlySession:
                     "只读信息路由异常: " + json.dumps(self.last_trace, ensure_ascii=False))
                 # No guessed task, fallback real-time answer, or conversational
                 # history contamination on a technical routing failure.
-                from core.utils.information_response import natural_response_enabled
+                from core.utils.information_response import model_reply_enabled as natural_response_enabled
                 packet.update(route="error", runtime_event=True)
                 if natural_response_enabled(self.conn):
                     packet['operation'] = {'kind':'route','status':'unavailable'}
