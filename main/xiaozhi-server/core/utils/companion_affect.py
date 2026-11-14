@@ -65,6 +65,8 @@ def select_affect(conn):
     if not isinstance(cfg, dict) or cfg.get('enabled') is not True:
         return None
     memory = getattr(conn, 'memory', None)
+    if not getattr(memory, 'managed', False) or getattr(memory, '_memory_scope_denied', False):
+        return None
     managed = getattr(memory, '_managed', memory)
     scope = getattr(managed, 'scope', None)
     if not getattr(managed, 'managed', False) or not isinstance(scope, str) or not scope:

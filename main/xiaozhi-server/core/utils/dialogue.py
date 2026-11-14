@@ -117,6 +117,7 @@ class Dialogue:
             repair_rejected_naming: bool = False,
             information_context=None,
             core_memory=None,
+            include_temporary: bool = True,
     ) -> List[Dict[str, str]]:
         # 构建对话
         dialogue = []
@@ -220,7 +221,8 @@ class Dialogue:
 
         # 第二段：few-shot 示例（会话内不变）
         non_system_messages = [m for m in self.dialogue if m.role != "system"]
-        fewshot_messages = [m for m in non_system_messages if m.is_temporary]
+        fewshot_messages = [m for m in non_system_messages
+                            if include_temporary and m.is_temporary]
         complete_fewshot = self._ensure_tool_calls_complete(fewshot_messages)
         for m in complete_fewshot:
             self.getMessages(m, dialogue)

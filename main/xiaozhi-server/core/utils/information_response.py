@@ -417,6 +417,10 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
                 'route':packet.get('route'),'read_status':(read or {}).get('status'),
                 'strategy':reply_policy.strategy if direct else 'legacy',
                 'review_revised':None if direct else not review['valid'],'attempt':attempt+1},ensure_ascii=False))
+            if (conn.config.get('companion_speech') or {}).get('enabled') is True:
+                # Only a fresh, validated retry may replace the initial speech
+                # epoch after a concurrent forget; unvalidated old text cannot.
+                packet['_speech_epoch'] = token[0] if token is not None else None
             yield answer
             return
         except Exception as exc:

@@ -329,6 +329,9 @@ async def send_tts_message(conn: "ConnectionHandler", state, text=None, turn_id=
     # 发送消息到客户端
     await conn.websocket.send(json.dumps(message))
     if state == 'stop' and not conn.client_abort:
+        if getattr(conn, '_recent_audio_sentence', None) == current_sentence_id:
+            from core.utils.companion_memory import mark_episode_delivery
+            await asyncio.to_thread(mark_episode_delivery, conn, current_sentence_id, 'audio_sent')
         dialogue = getattr(conn, "dialogue", None)
         if dialogue is not None:
             dialogue.mark_delivery(current_sentence_id, "audio_sent")

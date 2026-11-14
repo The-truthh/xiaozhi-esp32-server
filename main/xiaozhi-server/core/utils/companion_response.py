@@ -141,6 +141,12 @@ def build_reply_messages(conn, data, policy, speaker=None):
             history.append({'role': 'user', 'content': current})
     if not system or not history or history[-1]['role'] != 'user':
         raise ValueError('Missing persona or current user turn')
+    from core.utils.companion_expression import render_expression_messages, select_dialogue_policy
+    system = render_expression_messages(conn, system)
+    rules = CONTEXT_RULES
+    if select_dialogue_policy(conn):
+        from core.utils.companion_topics import ROLE_TOPIC_RULES
+        rules += ROLE_TOPIC_RULES
 
     context = deepcopy(data)
     context.pop('current_user_utterance', None)  # Already the actual final user message.
@@ -158,7 +164,7 @@ def build_reply_messages(conn, data, policy, speaker=None):
 
     def assemble():
         selected = [m for group in groups for m in group]
-        block = {'role': 'system', 'content': CONTEXT_RULES + '\n<turn_context>\n'
+        block = {'role': 'system', 'content': rules + '\n<turn_context>\n'
                  + _serialize(context) + '\n</turn_context>'}
         return system + selected[:-1] + [block, selected[-1]]
 
@@ -189,7 +195,7 @@ def build_reply_messages(conn, data, policy, speaker=None):
     })
 
 
-def generate_role_reply(conn, request, policy, packet, sentence_id=None):
+def generate_role_reply(conn, request, policy, packet, sentence_id=None, _format_repair=False):
     """Exactly one author call; buffer until facts and the active turn can be checked."""
     from core.utils.information_response import _spoken
 
@@ -219,6 +225,17 @@ def generate_role_reply(conn, request, policy, packet, sentence_id=None):
     if not reply_is_current(conn, packet, sentence_id):
         return None
     text = _spoken(''.join(chunks))
+    from core.utils.companion_expression import select_dialogue_policy, spoken_format_feedback
+    feedback = spoken_format_feedback(text) if select_dialogue_policy(conn) else None
+    if feedback:
+        if _format_repair:
+            raise ValueError('Author repeated internal analysis in spoken reply')
+        revised = deepcopy(request.messages)
+        revised.insert(len(revised)-1, {'role':'system', 'content':feedback})
+        if len(_serialize(revised)) > policy.max_input_chars:
+            raise ValueError('Spoken repair exceeds input budget')
+        repair = ReplyRequest(revised, dict(request.diagnostics, spoken_format_repair=True))
+        return generate_role_reply(conn, repair, policy, packet, sentence_id, _format_repair=True)
     if text.startswith(('{', '[')):
         try:
             value = json.loads(text)

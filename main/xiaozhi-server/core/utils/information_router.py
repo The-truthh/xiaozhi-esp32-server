@@ -223,11 +223,23 @@ class ReadOnlySession:
                 '个人事实直接查询仍走memory_query，不靠这个字段代替。')
             prompt += ('刚刚回答过本人喜好后，用户说“把音乐偏好按原话念一下”等追问，'
                        '仍走memory_query且字段facts，重新读用户原始证据，不能把助手概括当作原话。')
+        from core.utils.companion_topics import router_topic_extension, ROUTER_TOPIC_RULES, validate_update
+        topic_extension = router_topic_extension(self.conn) if natural else None
+        if topic_extension:
+            schema = copy.deepcopy(schema)
+            schema['properties']['dialogue_update'] = topic_extension['schema']
+            schema['required'].append('dialogue_update')
+            payload['topic_catalog'] = topic_extension['catalog']
+            prompt += ROUTER_TOPIC_RULES
         raw = await asyncio.wait_for(asyncio.to_thread(
             llm.response_structured, prompt, json.dumps(payload, ensure_ascii=False), schema,
             timeout=6), timeout=7)
         proposed = json.loads(raw)
         meta = {}
+        if topic_extension:
+            meta['_dialogue_update'] = validate_update(proposed.pop('dialogue_update',None),speech(text),
+                {r['id'] for r in topic_extension['catalog']})
+            meta['_dialogue_epoch'] = topic_extension['epoch']
         if natural:
             for key in ('user_fact_statement','related_context_needed'):
                 value = proposed.pop(key)
@@ -336,6 +348,9 @@ class ReadOnlySession:
                 if natural:packet['related_context_needed'] = plan.get('_related_context_needed',False)
                 if natural:packet['assistant_history_needed'] = plan.get('_assistant_history_needed',False)
                 if natural:packet['recent_context_needed'] = plan.get('_recent_context_needed',False)
+                if natural and '_dialogue_update' in plan:
+                    packet['dialogue_update'] = plan['_dialogue_update']
+                    packet['dialogue_epoch'] = plan['_dialogue_epoch']
                 if plan.get("memory_query"):
                     # Read the canonical facts in chat immediately before TTS,
                     # not an answer invented or cached by the intent model.

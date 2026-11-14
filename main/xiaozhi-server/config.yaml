@@ -116,6 +116,16 @@ companion_dialogue:
   topics_enabled: true
   topic_ttl_hours: 12
   max_topics: 3
+# Q5 朗读方向，只传实际支持的引擎参数，不改台词；默认关闭。
+companion_speech:
+  enabled: false
+  companion_id: xiaoyuan
+  allowed_device_ids: []
+  allowed_subject_scopes: []
+  mode: natural
+  slow_rate: 0.85
+  fast_rate: 1.15
+  ttl_seconds: 60
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词

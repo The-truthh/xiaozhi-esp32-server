@@ -315,7 +315,8 @@ class Store:
             # partial forget conservatively withdraws them too; old workers
             # cannot restore them after the epoch change.
             for table in ('companion_affect', 'companion_affect_events', 'companion_episodes',
-                          'companion_episode_sources', 'companion_episode_jobs', 'companion_episode_audit'):
+                          'companion_episode_sources', 'companion_episode_jobs', 'companion_episode_audit',
+                          'companion_topics'):
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
                     db.execute('DELETE FROM ' + table + ' WHERE scope=?', (scope,))
             # Every old extraction job is fenced; even old sources can no longer

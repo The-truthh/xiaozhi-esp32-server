@@ -16,6 +16,8 @@ async def handleAbortMessage(conn: "ConnectionHandler"):
     interrupted_turn = getattr(conn, "sentence_id", None)
     from core.utils.companion_affect import cancel_affect_turn
     await asyncio.to_thread(cancel_affect_turn, conn, interrupted_turn, withdraw=True)
+    from core.utils.companion_memory import mark_episode_delivery
+    await asyncio.to_thread(mark_episode_delivery, conn, interrupted_turn, 'interrupted')
     dialogue = getattr(conn, "dialogue", None)
     if dialogue is not None:
         dialogue.mark_delivery(interrupted_turn, "interrupted")

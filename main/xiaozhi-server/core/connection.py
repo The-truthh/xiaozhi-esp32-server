@@ -1087,15 +1087,22 @@ class ConnectionHandler:
         if query is not None:
             self.logger.bind(tag=TAG).info(f"大模型收到用户消息: {query}")
 
+        enqueue_tts = self.tts.tts_text_queue.put
         # 为最顶层时新建会话ID和发送FIRST请求
         if depth == 0:
             current_sentence_id = str(uuid.uuid4().hex)
             self.sentence_id = current_sentence_id  # 更新共享属性
+            if (self.config.get('companion_speech') or {}).get('enabled') is True:
+                try:
+                    from core.utils.companion_speech import SpeechQueue
+                    enqueue_tts = SpeechQueue(self, query, lookup_context, current_sentence_id).put
+                except Exception as exc:
+                    self.logger.bind(tag=TAG).warning('朗读方向未启用，沿用原合成: '+type(exc).__name__)
             self.dialogue.put(Message(
                 role="user", content=query,
                 is_runtime_event=bool((lookup_context or {}).get("runtime_event")),
             ))
-            self.tts.tts_text_queue.put(
+            enqueue_tts(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
                     sentence_type=SentenceType.FIRST,
@@ -1410,7 +1417,7 @@ class ConnectionHandler:
                                     new_part = self._clean_response_garbage(new_part)
                                     if new_part:
                                         tc["_da_sent"] = safe_end
-                                        self.tts.tts_text_queue.put(
+                                        enqueue_tts(
                                             TTSMessageDTO(
                                                 sentence_id=current_sentence_id,
                                                 sentence_type=SentenceType.MIDDLE,
@@ -1433,7 +1440,7 @@ class ConnectionHandler:
                 if content is not None and len(content) > 0:
                     if not tool_call_flag:
                         response_message.append(content)
-                        self.tts.tts_text_queue.put(
+                        enqueue_tts(
                             TTSMessageDTO(
                                 sentence_id=current_sentence_id,
                                 sentence_type=SentenceType.MIDDLE,
@@ -1443,7 +1450,7 @@ class ConnectionHandler:
                         )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
-            self.tts.tts_text_queue.put(
+            enqueue_tts(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
                     sentence_type=SentenceType.MIDDLE,
@@ -1452,7 +1459,7 @@ class ConnectionHandler:
                 )
             )
             if depth == 0:
-                self.tts.tts_text_queue.put(
+                enqueue_tts(
                     TTSMessageDTO(
                         sentence_id=current_sentence_id,
                         sentence_type=SentenceType.LAST,
@@ -1508,7 +1515,7 @@ class ConnectionHandler:
                             if remaining:
                                 remaining = self._clean_response_garbage(remaining)
                                 if remaining:
-                                    self.tts.tts_text_queue.put(
+                                    enqueue_tts(
                                         TTSMessageDTO(
                                             sentence_id=current_sentence_id,
                                             sentence_type=SentenceType.MIDDLE,
@@ -1523,7 +1530,7 @@ class ConnectionHandler:
 
                     if not real_tool_calls:
                         if depth == 0:
-                            self.tts.tts_text_queue.put(
+                            enqueue_tts(
                                 TTSMessageDTO(
                                     sentence_id=current_sentence_id,
                                     sentence_type=SentenceType.LAST,
@@ -1628,7 +1635,7 @@ class ConnectionHandler:
                 complete_episode_turn(self, text_buff, current_sentence_id, lookup_context)
 
         if depth == 0:
-            self.tts.tts_text_queue.put(
+            enqueue_tts(
                 TTSMessageDTO(
                     sentence_id=current_sentence_id,
                     sentence_type=SentenceType.LAST,
