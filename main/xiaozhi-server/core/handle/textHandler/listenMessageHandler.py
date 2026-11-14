@@ -107,10 +107,11 @@ class ListenTextMessageHandler(TextMessageHandler):
                     conn.just_woken_up = True
                     # 上报纯文字数据（复用ASR上报功能，但不提供音频数据）
                     enqueue_asr_report(conn, "嘿，你好呀", [])
-                    await startToChat(conn, "嘿，你好呀")
+                    await startToChat(conn, "嘿，你好呀", origin="automatic_wakeup")
                 else:
                     conn.just_woken_up = True
                     # 上报纯文字数据（复用ASR上报功能，但不提供音频数据）
                     enqueue_asr_report(conn, original_text, [])
                     # 否则需要LLM对文字内容进行答复
-                    await startToChat(conn, original_text)
+                    origin = "automatic_wakeup" if msg_json.get("source") == "automatic_wakeup" else "user_text"
+                    await startToChat(conn, original_text, origin=origin)

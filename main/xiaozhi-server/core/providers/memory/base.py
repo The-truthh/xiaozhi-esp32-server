@@ -6,6 +6,8 @@ logger = setup_logging()
 
 
 class MemoryProviderBase(ABC):
+    managed = False
+
     def __init__(self, config):
         self.config = config
         self.role_id = None
@@ -26,3 +28,11 @@ class MemoryProviderBase(ABC):
     def init_memory(self, role_id, llm, **kwargs):
         self.role_id = role_id
         self.llm = llm
+
+    async def ingest_turn(self, event):
+        """Optional durable per-turn ingest; legacy providers retain save_memory."""
+        return None
+
+    async def control(self, text, event):
+        """Optional application-owned memory operations, never arbitrary tools."""
+        return None

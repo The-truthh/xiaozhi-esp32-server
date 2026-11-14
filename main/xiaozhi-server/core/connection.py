@@ -29,7 +29,7 @@ from core.utils.modules_initialize import (
 )
 from core.handle.reportHandle import report, enqueue_tool_report
 from core.providers.tts.default import DefaultTTS
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from core.utils.dialogue import Message, Dialogue
 from core.providers.asr.dto.dto import InterfaceType
 from core.handle.textHandle import handleTextMessage
@@ -1143,11 +1143,20 @@ class ConnectionHandler:
             # 使用带记忆的对话
             memory_str = None
             # 仅当query非空（代表用户询问）时查询记忆
-            if self.memory is not None and query:
+            skip_memory = (lookup_context or {}).get('route') in ('grounded','memory','memory_query','lookup','clarify','cancel','unsupported')
+            if self.memory is not None and query and not skip_memory:
                 future = asyncio.run_coroutine_threadsafe(
                     self.memory.query_memory(query), self.loop
                 )
-                memory_str = future.result()
+                try:
+                    memory_str = future.result(timeout=.7)
+                except FutureTimeoutError:
+                    future.cancel()
+                    memory_str = ''
+                    self.logger.bind(tag=TAG).warning('记忆检索超过时限，本轮按当前会话继续')
+                except Exception as exc:
+                    memory_str = ''
+                    self.logger.bind(tag=TAG).warning(f'记忆检索不可用: {type(exc).__name__}')
 
             # 仅在该说话人首次出现时把身份注入 system，之后靠对话历史首轮保留，
             # 避免每轮在 system 重复出现名字诱导模型反复称呼
@@ -1162,6 +1171,13 @@ class ConnectionHandler:
             runtime_capabilities = build_runtime_capabilities(
                 self.config, functions, memory_str, self.intent_type
             )
+            if getattr(self.memory, 'memory_unavailable', False):
+                runtime_capabilities.update(memory_provider='unavailable', cross_session_recall='unavailable',
+                                            memory_write_this_turn='unavailable；没有保存能力，不可承诺已记住')
+            if getattr(self.memory, 'managed', False):
+                runtime_capabilities['memory_write_this_turn'] = (
+                    'queued_or_processing；没有完成回执时不能承诺已保存'
+                    if (lookup_context or {}).get('memory_job') else 'no_write_receipt')
             if lookup_context and lookup_context.get("evidence"):
                 runtime_capabilities["information_lookup"] = {
                     "status": "实际读取结果见本轮资料；失败不代表查到",
@@ -1179,7 +1195,38 @@ class ConnectionHandler:
                 self.dialogue.get_naming_grounded_response()
                 if depth == 0 and (self.intent_type == "nointent" or lookup_context) else None
             )
-            if lookup_context and lookup_context.get("direct_response"):
+            if lookup_context and lookup_context.get('memory_query'):
+                def personal_fact_responses():
+                    # Resolve lazily at delivery, not when the intent model
+                    # started: a correction/delete may have completed meanwhile.
+                    if self.client_abort or lookup_context['generation'] != getattr(self, 'lookup_generation', None):
+                        return
+                    try:
+                        if not getattr(self.memory, 'managed', False):
+                            raise PermissionError('Personal memory unavailable')
+                        if lookup_context['memory_query'] == 'facts':
+                            answer = self.memory.answer_facts(lookup_context.get('memory_selection', []),
+                                                             lookup_context.get('memory_read_status', 'unavailable'))
+                        else:
+                            answer = self.memory.answer_identity(lookup_context['memory_query'])
+                    except Exception as exc:
+                        answer = {'status': 'unavailable', 'facts': [],
+                                  'error_class': type(exc).__name__,
+                                  'response': ('这次暂时查不了之前的个人信息，我先不乱猜。'
+                                               if lookup_context['memory_query'] == 'facts'
+                                               else '这次暂时查不了之前的姓名和称呼，我先不乱猜。')}
+                    self.logger.bind(tag=TAG).info('个人事实回答: ' + json.dumps(
+                        {k: v for k, v in answer.items() if k != 'response'}, ensure_ascii=False))
+                    yield answer['response']
+                    if self.client_abort or lookup_context['generation'] != getattr(self, 'lookup_generation', None):
+                        return
+                    if lookup_context.get('direct_response'):
+                        yield lookup_context['direct_response']
+                    elif lookup_context.get('evidence'):
+                        from core.utils.information_response import information_reply
+                        yield information_reply(self, llm_dialogue, lookup_context['evidence'])
+                llm_responses = personal_fact_responses()
+            elif lookup_context and lookup_context.get("direct_response"):
                 llm_responses = iter([lookup_context["direct_response"]])
             elif grounded_response is not None:
                 # Use the same history and TTS pipeline; don't generate a fake

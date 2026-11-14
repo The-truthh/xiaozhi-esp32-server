@@ -40,7 +40,7 @@ async def resume_vad_detection(conn: "ConnectionHandler"):
     conn.just_woken_up = False
 
 
-async def startToChat(conn: "ConnectionHandler", text):
+async def startToChat(conn: "ConnectionHandler", text, origin="asr"):
     # 检查输入是否是JSON格式（包含说话人信息）
     speaker_name = None
     actual_text = text
@@ -102,7 +102,11 @@ async def startToChat(conn: "ConnectionHandler", text):
         if not hasattr(conn, "information_session"):
             conn.information_session = ReadOnlySession(conn)
         await send_stt_message(conn, actual_text)
-        conn.information_session.submit(actual_text)
+        from datetime import datetime, timezone
+        import uuid
+        event = {'id': uuid.uuid4().hex, 'role': 'user', 'text': actual_text,
+                 'origin': origin, 'observed_at': datetime.now(timezone.utc).isoformat()}
+        conn.information_session.submit(actual_text, event)
         return
 
     # 首先进行意图分析，使用实际文本内容

@@ -131,7 +131,7 @@ class Dialogue:
             if memory_str is not None:
                 full_prompt = re.sub(
                     r"<memory>.*?</memory>",
-                    f"<memory>\n{memory_str}\n</memory>",
+                    lambda match: f"<memory>\n{memory_str}\n</memory>",
                     full_prompt,
                     flags=re.DOTALL,
                 )
