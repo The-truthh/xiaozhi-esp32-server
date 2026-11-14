@@ -106,6 +106,16 @@ companion_memory:
   retention_days: 90
   max_records: 3
   context_max_chars: 4000
+# Q4 测试版小圆表达与短期话题意愿，独立灰度，默认关闭。
+companion_dialogue:
+  enabled: false
+  profile_version: xiaoyuan-q4-v3
+  companion_id: xiaoyuan
+  allowed_device_ids: []
+  allowed_subject_scopes: []
+  topics_enabled: true
+  topic_ttl_hours: 12
+  max_topics: 3
 # 开启唤醒词加速
 enable_wakeup_words_response_cache: true
 # 开场是否回复唤醒词

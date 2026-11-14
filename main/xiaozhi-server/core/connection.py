@@ -1624,6 +1624,8 @@ class ConnectionHandler:
             if depth == 0:
                 from core.utils.companion_affect import complete_affect_turn
                 complete_affect_turn(self, text_buff, current_sentence_id, lookup_context)
+                from core.utils.companion_memory import complete_episode_turn
+                complete_episode_turn(self, text_buff, current_sentence_id, lookup_context)
 
         if depth == 0:
             self.tts.tts_text_queue.put(
@@ -1793,6 +1795,8 @@ class ConnectionHandler:
         try:
             from core.utils.companion_affect import cancel_affect_turn
             await asyncio.to_thread(cancel_affect_turn, self)
+            from core.utils.companion_memory import close_episode_turns
+            await asyncio.to_thread(close_episode_turns, self)
             if hasattr(self, "information_session"):
                 self.information_session.invalidate()
             # 清理 VAD 连接资源

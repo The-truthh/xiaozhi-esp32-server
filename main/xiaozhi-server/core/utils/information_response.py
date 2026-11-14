@@ -151,6 +151,12 @@ def delivery_tool_results(bundles, utterance):
 
 
 def _compose_reply(conn, messages, data, draft):
+    from core.utils.companion_expression import select_dialogue_policy, spoken_format_feedback
+    q4_enabled = select_dialogue_policy(conn) is not None
+    # A rejected style draft is not evidence. Refeeding its full text on every
+    # retry anchored the final author to the same analysis/weather sentence.
+    if q4_enabled and spoken_format_feedback(draft):
+        draft = ''
     data = dict(data, tool_results=delivery_tool_results(
         data['tool_results'], data.get('current_user_utterance')))
     expected = [i for b in data['tool_results'] if b.get('topic')=='news' and b.get('status')=='ok'
@@ -183,6 +189,8 @@ def _compose_reply(conn, messages, data, draft):
                     or any(type(n) is not int for n in result['news_numbers'])):
                 raise ValueError('Invalid response composition')
             answer = _spoken(result['reply'])
+            if q4_enabled and spoken_format_feedback(answer):
+                raise ValueError(spoken_format_feedback(answer))
             origin = data.get('runtime_capabilities', {}).get('input', {}).get('origin')
             source_denials = re.finditer(
                     r'听不(?:到|见).{0,8}(?:声音|语音)|(?:只能|只(?:能)?看(?:到|见)).{0,6}(?:文字|文本|打字)'
@@ -211,6 +219,8 @@ def _compose_reply(conn, messages, data, draft):
             if has_weather and not re.search(r'预报|预计|估计|预测|大约|可能|大概',answer):
                 raise ValueError('天气结果包含模式估计或预报，请自然使用预计、预报、可能等词，不把预测说成已发生的实测事实')
             if not has_weather and re.search(r'(?:今天|今儿|现在|外面).{0,4}天气.{0,3}(?:不错|很好|好|晴|下雨|下雪)',answer):
+                if q4_enabled:
+                    raise ValueError('这轮没有实际天气依据。请换成不依赖天气事实的说法或开场白，不能继续复用草稿里的天气；用新句子完成当前请求，不让用户重说。')
                 raise ValueError('No actual weather result supports a claim about current weather')
             if result['news_numbers'] != expected:
                 raise ValueError('news_numbers must equal '+str(expected))
@@ -223,7 +233,7 @@ def _compose_reply(conn, messages, data, draft):
         except ValueError as exc:
             if attempt:raise
             payload['format_correction'] = str(exc)
-            payload['draft'] = result.get('reply','') if isinstance(locals().get('result'),dict) else ''
+            payload['draft'] = '' if q4_enabled else (result.get('reply','') if isinstance(locals().get('result'),dict) else '')
     raise ValueError('No composed reply')
 
 
@@ -243,6 +253,9 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
     affect_turn = prepare_affect_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
     from core.utils.companion_memory import prepare_episode_turn, episode_context, episode_context_current
     episode_turn = prepare_episode_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
+    from core.utils.companion_topics import prepare_topic_turn, topic_context, topic_context_current
+    from core.utils.companion_expression import render_expression_messages, select_dialogue_policy
+    topic_turn = prepare_topic_turn(conn, packet, query, sentence_id or getattr(conn, 'sentence_id', None))
     def current():
         if direct:
             from core.utils.companion_response import reply_is_current
@@ -347,6 +360,9 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
         if episodes:
             data['companion_episodes'] = episodes
             capabilities['memory_returned_this_request'] = True
+        topics, topic_token = topic_context(conn, topic_turn, episodes)
+        if topics:
+            data['companion_dialogue'] = topics
         # Recompile fresh per attempt: do not carry stale assembled memory or a
         # fixed technical answer into a retry. Stored dialogue remains auditable.
         try:
@@ -366,6 +382,10 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
                 context = TURN_RULES+'\n<current_turn_data>\n'+json.dumps(data,ensure_ascii=False).replace('<','\\u003c')+'\n</current_turn_data>'
                 position = len(messages)-1 if messages and messages[-1]['role']=='user' else len(messages)
                 messages.insert(position, {'role':'system','content':context})
+                messages = render_expression_messages(conn, messages)
+                if select_dialogue_policy(conn):
+                    from core.utils.companion_topics import ROLE_TOPIC_RULES
+                    messages[0]['content'] += ROLE_TOPIC_RULES
             draft = ''
             # Reads/operations are composed directly from the actual data and
             # frozen persona. Passing a character model's guessed biography as
@@ -389,6 +409,9 @@ def natural_reply_responses(conn, packet, memory_text, speaker=None, query=None,
                 continue
             if not episode_context_current(conn, episode_turn, episode_token):
                 conn.logger.bind(tag='companion_memory').info('经历来源变化，重新读取并生成')
+                continue
+            if not topic_context_current(conn, topic_turn, topic_token):
+                conn.logger.bind(tag='companion_topics').info('话题状态变化，重新读取并生成')
                 continue
             conn.logger.bind(tag='natural_response').info('角色回答交付: '+json.dumps({
                 'route':packet.get('route'),'read_status':(read or {}).get('status'),

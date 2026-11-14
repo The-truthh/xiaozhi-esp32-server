@@ -388,3 +388,132 @@ class EpisodeStore(CompanionStore):
             db.execute('INSERT INTO companion_episode_audit(scope,companion_id,episode_id,action,revision,observed_at,note) VALUES(?,?,?,?,?,?,?)',
                        (scope,companion,identifier,'delete' if delete else 'edit',revision+1,time.time(),str(note)[:160] if not delete else ''))
             return True
+
+
+class TopicStore(CompanionStore):
+    """Small scoped conversational state, never a second fact ledger."""
+    def __init__(self,ledger):
+        super().__init__(ledger,initialize_affect=False)
+        with self.db() as db:
+            db.executescript('''CREATE TABLE IF NOT EXISTS companion_topics(
+                id TEXT PRIMARY KEY,scope TEXT NOT NULL,companion_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,topic TEXT NOT NULL,pending_point TEXT NOT NULL,
+                user_preference TEXT NOT NULL DEFAULT '{}',source_refs TEXT NOT NULL DEFAULT '[]',
+                session_id TEXT NOT NULL,source_turn TEXT NOT NULL,last_mentioned REAL NOT NULL,
+                status TEXT NOT NULL,expires_at REAL NOT NULL,revision INTEGER NOT NULL,
+                is_current INTEGER NOT NULL DEFAULT 0,seen_turns TEXT NOT NULL DEFAULT '[]',
+                source_episode TEXT,episode_revision INTEGER);
+                CREATE INDEX IF NOT EXISTS topics_subject ON companion_topics(scope,companion_id,epoch,last_mentioned);''')
+
+    def catalog(self,scope,companion,limit=5):
+        with self.db() as db:
+            epoch=self.ledger._epoch(db,scope)
+            rows=db.execute('SELECT * FROM companion_topics WHERE scope=? AND companion_id=? AND epoch=? '
+                'AND expires_at>? ORDER BY is_current DESC,last_mentioned DESC LIMIT ?',
+                (scope,companion,epoch,time.time(),limit)).fetchall()
+            return epoch,[dict(r) for r in rows]
+
+    def apply_topic(self,scope,companion,epoch,session,turn,update,ttl):
+        """Apply only current user evidence; same turn retry cannot reactivate a topic."""
+        stamp=time.time();event=session+':'+turn
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if self.ledger._epoch(db,scope)!=epoch:return False
+            db.execute("UPDATE companion_topics SET status='expired',is_current=0,revision=revision+1 "
+                "WHERE scope=? AND companion_id=? AND expires_at<=? AND status!='expired'",(scope,companion,stamp))
+            rows=[dict(r) for r in db.execute('SELECT * FROM companion_topics WHERE scope=? AND companion_id=? AND epoch=? AND expires_at>?',
+                (scope,companion,epoch,stamp))]
+            if any(event in json.loads(r['seen_turns']) for r in rows):return True
+            action=update['topic_action'];target=update['topic_id']
+            row=next((r for r in rows if r['id']==target),None) if target else next((r for r in rows if r['is_current']),None)
+            if target and row is None:return False
+            if action=='none' and not update['preferences']:return True
+            if action=='new' or row is None:
+                identifier=hashlib.sha256(json.dumps([scope,companion,epoch,event]).encode()).hexdigest()
+                row=dict(id=identifier,scope=scope,companion_id=companion,epoch=epoch,
+                    topic=update['topic_label'] or '此刻的交流',pending_point=update['pending_point'],
+                    user_preference='{}',source_refs='[]',session_id=session,source_turn=turn,
+                    last_mentioned=stamp,status='pending',expires_at=stamp+ttl,revision=0,is_current=1,seen_turns='[]',
+                    source_episode=None,episode_revision=None)
+            if action in ('new','continue') or not rows:
+                db.execute('UPDATE companion_topics SET is_current=0 WHERE scope=? AND companion_id=? AND is_current=1 AND id!=?',
+                    (scope,companion,row['id']))
+                row['is_current']=1
+            if action=='continue':row['status']='pending'
+            if action=='continue' and update['topic_label'] and update['evidence_quote']:
+                row['topic']=update['topic_label']
+            if action in ('decline','resolve'):
+                row['status']='declined' if action=='decline' else 'resolved'
+                row['pending_point']='';row['user_preference']='{}'
+            if update['pending_point'] and action not in ('decline','resolve'):row['pending_point']=update['pending_point']
+            preferences=json.loads(row['user_preference'])
+            for p in update['preferences']:
+                preferences[p['key']]=dict(value=p['value'],quote=p['quote'],source_ref=event+':user')
+            row['user_preference']=json.dumps(preferences,ensure_ascii=False)
+            refs=json.loads(row['source_refs'])
+            if update['evidence_quote']:refs.append(dict(ref=event+':user',quote=update['evidence_quote']))
+            refs.extend(dict(ref=event+':user',quote=p['quote']) for p in update['preferences'])
+            row.update(source_refs=json.dumps(refs[-8:],ensure_ascii=False),source_turn=turn,session_id=session,
+                last_mentioned=stamp,expires_at=stamp+ttl,revision=row['revision']+1,
+                seen_turns=json.dumps((json.loads(row['seen_turns'])+[event])[-32:]))
+            columns=list(row)
+            db.execute('INSERT OR REPLACE INTO companion_topics('+','.join(columns)+') VALUES('+','.join('?' for _ in columns)+')',tuple(row[k] for k in columns))
+            # Only small topical state survives. Prune old, non-current rows.
+            db.execute('DELETE FROM companion_topics WHERE scope=? AND companion_id=? AND is_current=0 AND '
+                '(expires_at<=? OR id NOT IN (SELECT id FROM companion_topics WHERE scope=? AND companion_id=? ORDER BY last_mentioned DESC LIMIT 64))',
+                (scope,companion,stamp,scope,companion))
+            return True
+
+    def sync_episode_topics(self,scope,companion,epoch,records,ttl):
+        """Only already retrieved unfinished Q3 episodes, with original revisions."""
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if self.ledger._epoch(db,scope)!=epoch:return
+            for r in records:
+                if not r.get('unfinished') or r.get('episode_status')!='active':continue
+                identifier='episode:'+r['id']
+                old=db.execute('SELECT revision,status,episode_revision FROM companion_topics WHERE id=? AND scope=? AND companion_id=?',
+                    (identifier,scope,companion)).fetchone()
+                if old and (old['status']=='declined' or old['episode_revision']==r['revision']):continue
+                # Q3 is optional. Never manufacture its table just to sync a topic.
+                valid=db.execute('SELECT revision FROM companion_episodes WHERE id=? AND scope=? AND companion_id=? AND epoch=? AND status=?',
+                    (r['id'],scope,companion,epoch,'active')).fetchone()
+                if not valid or valid[0]!=r['revision']:continue
+                db.execute('INSERT OR REPLACE INTO companion_topics VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (identifier,scope,companion,epoch,r['topic'],r['event_summary'],'{}',
+                     json.dumps([r['user_quote']],ensure_ascii=False),r['source_session'],r['source_turn'],time.time(),
+                     'pending',time.time()+ttl,(old['revision']+1) if old else 1,0,'[]',r['id'],r['revision']))
+
+    def topic_context(self,scope,companion,epoch,related_ids,maximum):
+        with self.db() as db:
+            db.execute('BEGIN')
+            if self.ledger._epoch(db,scope)!=epoch:return None,None
+            rows=[dict(r) for r in db.execute('SELECT * FROM companion_topics WHERE scope=? AND companion_id=? AND epoch=? '
+                'AND expires_at>? ORDER BY is_current DESC,last_mentioned DESC LIMIT 64',(scope,companion,epoch,time.time()))]
+            selected=[]
+            for r in rows:
+                if r['source_episode']:
+                    source=db.execute('SELECT revision,status FROM companion_episodes WHERE id=? AND epoch=?',(r['source_episode'],epoch)).fetchone()
+                    if not source or source['revision']!=r['episode_revision'] or source['status']!='active':continue
+                if r['is_current'] or (r['source_episode'] in related_ids and r['status']=='pending'):
+                    selected.append(r)
+                if len(selected)>=maximum:break
+            current=next((r['id'] for r in rows if r['is_current']),'')
+            token=(epoch,current,tuple((r['id'],r['revision'],r['source_episode'],r['episode_revision'],r['is_current']) for r in selected))
+            return selected,token
+
+    def topic_context_current(self,scope,companion,token):
+        epoch,current,refs=token
+        with self.db() as db:
+            if self.ledger._epoch(db,scope)!=epoch:return False
+            active=db.execute('SELECT id FROM companion_topics WHERE scope=? AND companion_id=? AND epoch=? AND is_current=1 AND expires_at>?',
+                (scope,companion,epoch,time.time())).fetchone()
+            if (active[0] if active else '')!=current:return False
+            for identifier,revision,source,source_revision,is_current in refs:
+                row=db.execute('SELECT revision,expires_at,is_current FROM companion_topics WHERE id=? AND scope=? AND companion_id=? AND epoch=?',
+                    (identifier,scope,companion,epoch)).fetchone()
+                if not row or row['revision']!=revision or row['expires_at']<=time.time() or row['is_current']!=is_current:return False
+                if source:
+                    old=db.execute('SELECT revision,status FROM companion_episodes WHERE id=? AND epoch=?',(source,epoch)).fetchone()
+                    if not old or old['revision']!=source_revision or old['status']!='active':return False
+            return True
